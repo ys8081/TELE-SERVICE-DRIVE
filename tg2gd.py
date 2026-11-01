@@ -81,6 +81,8 @@ PORT = int(os.environ.get("PORT", 8080))
 PASSWORD = os.environ.get("APP_PASSWORD", "808177")
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
 STATE_INTERVAL = float(os.environ.get("STATE_INTERVAL", 3))
+CONN = int(os.environ.get("CONN", 2))                    # har account ke liye same connections (primary bhi)
+PRIMARY_SMALL = os.environ.get("PRIMARY_SMALL", "0") == "1"   # 1 = chhoti files sirf primary se (default band)
 SEG = 8 * 1024 * 1024            # 1 segment = 8 MB (accounts me baante jaate hain)
 REQ = 1024 * 1024                # telegram request size
 STATE_TAG = "TG2GD_STATE"
@@ -387,7 +389,7 @@ async def download_msg(msg, size, path):
         S["accs"][PRIMARY_AID]["bytes"] += real
         return real
 
-    if size <= SEG:                      # chhoti file: sirf primary se, overhead kam
+    if PRIMARY_SMALL and size <= SEG:    # chhoti file: sirf primary se (default band, sab barabar)
         pa = S["accs"][PRIMARY_AID]
         for attempt in range(3):
             if pa["status"] != "ok":
@@ -1188,7 +1190,7 @@ async def on_start(app):
             continue
         CLIENTS[a["id"]] = cl
         S["accs"][a["id"]] = {"idx": len(S["accs"]), "name": a["name"], "phone": a["phone"], "bytes": 0,
-                              "speed": 0, "segs": 0, "conn": int(a.get("cfg", {}).get("conn", 2)),
+                              "speed": 0, "segs": 0, "conn": CONN,
                               "status": "ok", "flood_until": 0, "floods": 0, "errors": 0, "last_err": ""}
         if a["id"] == cfg.get("active") or PRIMARY is None:
             PRIMARY, PRIMARY_AID = cl, a["id"]
