@@ -170,7 +170,7 @@ def state_dict():
     return d
 
 
-async def save_state(force=False):
+async def save_state(force=False, _retry=True):
     global STATE_MSG_ID
     if not PRIMARY or time.time() < STATE_BLOCK[0]:
         return
@@ -192,12 +192,17 @@ async def save_state(force=False):
         STATE_BLOCK[0] = time.time() + e.seconds + 1
         log(f"state save: FloodWait {e.seconds}s (baad me save hoga)", "warn")
     except Exception as e:
-        s = str(e).lower()
-        if "not modified" in s:
+        s = (type(e).__name__ + " " + str(e)).lower()
+        if "not modified" in s or "messagenotmodified" in s:
             save_state.last = body
             S["state_ts"] = time.time()
-        elif "message_id_invalid" in s or "not found" in s:
+        elif ("message_id_invalid" in s or "messageidinvalid" in s or "id is invalid" in s
+              or "not found" in s or "messageauthorrequired" in s or "can't do that operation" in s):
+            # purana state message edit nahi ho sakta -> naya bhej do
+            log("state message invalid tha -> naya state message bana raha hoon", "warn")
             STATE_MSG_ID = None
+            if _retry:
+                await save_state(True, _retry=False)
         else:
             log(f"state save err: {e}", "err")
 
@@ -285,7 +290,19 @@ async def resolve_channel(client, spec, who=""):
     from telethon.tl.types import ChatInviteAlready
     kind, val = parse_channel(spec)
     if kind == "invite":
-        r = await client(CheckChatInviteRequest(val))
+        try:
+            r = await client(CheckChatInviteRequest(val))
+        except Exception as e:
+            if type(e).__name__ in ("InviteHashExpiredError", "InviteHashInvalidError"):
+                # link expire/revoke ho gaya -> agar account already member hai to dialogs se utha lo
+                async for dlg in client.iter_dialogs():
+                    if (S.get("_ent_id") and dlg.entity.id == S["_ent_id"]) or \
+                       (S.get("channel_title") and dlg.name == S["channel_title"]):
+                        log(f"[{who}] invite link expire, par channel dialogs me mil gaya: {dlg.name}", "warn")
+                        return dlg.entity
+                raise RuntimeError("Invite link expire/revoke ho gaya aur ye account channel me nahi hai. "
+                                   "Naya invite link, @username ya -100... channel id daalo.")
+            raise
         if isinstance(r, ChatInviteAlready):
             return r.chat
         log(f"[{who}] channel ka member nahi tha -> invite link se join kar raha hoon", "warn")
@@ -953,7 +970,7 @@ canvas{display:block;width:100%}
 <div><label>Channel (@username / invite link / id)</label><input id=in_ch placeholder="https://t.me/+xxxxxxxx"></div>
 <div><label>Drive folder (URL ya ID)</label><input id=in_fo placeholder="https://drive.google.com/drive/folders/..."></div>
 <div><label>Start msg ID</label><input id=in_si type=number value=0 min=0></div>
-<div class=btns><button id=b_go onclick=go()>▶ Start / Resume</button><button id=b_st class=stop onclick=stp()>■ Stop</button></div>
+<div class=btns><label style="display:flex;align-items:center;gap:5px;margin:0;white-space:nowrap"><input type=checkbox id=in_fr style="width:auto"> Fresh (cache clear)</label><button id=b_go onclick=go()>▶ Start / Resume</button><button id=b_st class=stop onclick=stp()>■ Stop</button></div>
 </div></div>
 
 <div class=stats>
@@ -989,7 +1006,7 @@ const fb=n=>{n=+n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<
 const ft=s=>{s=Math.round(s);if(!isFinite(s)||s<=0)return '—';const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+'h '+m+'m':m?m+'m '+x+'s':x+'s'};
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 let filled=false,lastMap='';
-async function go(){const r=await fetch('/api/start',{method:'POST',body:JSON.stringify({channel:$('in_ch').value,folder:$('in_fo').value,start_id:+$('in_si').value||0})});filled=true}
+async function go(){const r=await fetch('/api/start',{method:'POST',body:JSON.stringify({channel:$('in_ch').value,folder:$('in_fo').value,start_id:+$('in_si').value||0,fresh:$('in_fr').checked})});$('in_fr').checked=false;filled=true}
 async function stp(){await fetch('/api/stop',{method:'POST'})}
 function drawChart(h){const c=$('chart'),W=c.clientWidth*devicePixelRatio,H=90*devicePixelRatio;c.width=W;c.height=H;const x=c.getContext('2d');
 const mx=Math.max(1048576,...h)*1.15;x.strokeStyle='#1c2740';x.lineWidth=1;for(let i=1;i<4;i++){const y=H*i/4;x.beginPath();x.moveTo(0,y);x.lineTo(W,y);x.stroke()}
@@ -1064,10 +1081,27 @@ async def h_status(req):
     return web.json_response(status_json())
 
 
-async def start_job(channel, folder, start_id):
+def reset_progress():
+    """Purana progress (last_done, cur, .part files) saaf - naye channel/fresh upload ke liye."""
+    S.update(last_done=0, done_count=0, total_bytes=0, _ent_id=None, channel_title="")
+    S["scan"] = {"files": 0, "bytes": 0}
+    cur_state["cur"] = None
+    save_state.last = None
+    try:
+        for fn in os.listdir(DATA_DIR):
+            if fn.endswith(".part"):
+                os.remove(os.path.join(DATA_DIR, fn))
+    except OSError:
+        pass
+
+
+async def start_job(channel, folder, start_id, fresh=False):
     global JOB
     if JOB and not JOB.done():
         return False
+    if fresh or (S["channel"] and S["channel"].strip() != channel.strip()):
+        log("fresh start: purana progress (last_done / cache) clear kiya", "warn")
+        reset_progress()
     S.update(channel=channel, folder=folder, start_id=start_id)
     JOB = asyncio.create_task(run_job())
     return True
@@ -1077,7 +1111,8 @@ async def h_start(req):
     if not authed(req):
         return web.Response(status=401)
     d = await req.json()
-    ok = await start_job(d["channel"].strip(), parse_folder(d["folder"]), int(d.get("start_id") or 0))
+    ok = await start_job(d["channel"].strip(), parse_folder(d["folder"]), int(d.get("start_id") or 0),
+                         bool(d.get("fresh")))
     return web.json_response({"ok": ok})
 
 
