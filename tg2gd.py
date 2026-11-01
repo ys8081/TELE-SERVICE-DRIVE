@@ -8,6 +8,7 @@ Missing packages khud install ho jaate hain. Same folder me accounts.json + toke
 
 Env (sab optional):
     PORT=8080  DATA_DIR=./data  APP_PASSWORD=808177  STATE_INTERVAL=3
+    CONN=1 (har account ke max parallel connections)  MAX_MBPS=2 (har account ki max download speed, MB/s; 0 = unlimited)
 """
 import os, sys, re, json, time, asyncio, secrets, logging, collections, shutil, subprocess, importlib
 
@@ -81,7 +82,10 @@ PORT = int(os.environ.get("PORT", 8080))
 PASSWORD = os.environ.get("APP_PASSWORD", "808177")
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
 STATE_INTERVAL = float(os.environ.get("STATE_INTERVAL", 3))
-CONN = int(os.environ.get("CONN", 2))                    # har account ke liye same connections (primary bhi)
+CONN = int(os.environ.get("CONN", 1))                    # har account ke liye max parallel connections (default 1)
+MAX_MBPS = float(os.environ.get("MAX_MBPS", 2))          # har account ki max download speed (MB/s), 0 = unlimited
+MAX_BPS = int(MAX_MBPS * 1024 * 1024)
+_NEXT = {}                                               # per-account throttle clock
 PRIMARY_SMALL = os.environ.get("PRIMARY_SMALL", "0") == "1"   # 1 = chhoti files sirf primary se (default band)
 SEG = 8 * 1024 * 1024            # 1 segment = 8 MB (accounts me baante jaate hain)
 REQ = 1024 * 1024                # telegram request size
@@ -376,6 +380,20 @@ def acc_dead(a, e):
     log(f"[{a['name']}] session DEAD ({type(e).__name__}) - ye account hata diya", "err")
 
 
+# ------------------------------------------------------------------ speed limiter (per account)
+async def throttle(aid, n):
+    """Is account ki total download speed MAX_BPS se upar nahi jaane deta."""
+    if MAX_BPS <= 0 or n <= 0:
+        return
+    now = time.monotonic()
+    nxt = max(_NEXT.get(aid, 0), now) + n / MAX_BPS
+    _NEXT[aid] = nxt
+    d = nxt - now
+    while d > 0 and not S["stop"]:
+        await asyncio.sleep(min(d, 0.5))
+        d -= 0.5
+
+
 # ------------------------------------------------------------------ download (segments across accounts)
 async def download_msg(msg, size, path):
     """Success par real size return, stop par None."""
@@ -384,6 +402,7 @@ async def download_msg(msg, size, path):
     if msg.photo and not msg.document:
         await flood_safe(lambda: PRIMARY.download_media(msg, file=path), "primary")
         real = os.path.getsize(path)
+        await throttle(PRIMARY_AID, real)
         dl.update(done=real, size=real, nseg=1, segs_done=1)
         CUR_OWNER[0] = bytearray([S["accs"][PRIMARY_AID]["idx"] + 1])
         S["accs"][PRIMARY_AID]["bytes"] += real
@@ -414,6 +433,7 @@ async def download_msg(msg, size, path):
                 if real != size:
                     raise RuntimeError(f"size mismatch {real}/{size}")
                 dl.update(done=real, segs_done=1)
+                await throttle(PRIMARY_AID, real)
                 return real
             except asyncio.CancelledError:
                 CUR_TASKS.clear()
@@ -521,6 +541,7 @@ async def download_msg(msg, size, path):
                     pos += len(chunk)
                     a["bytes"] += len(chunk)
                     dl["done"] += len(chunk)
+                    await throttle(aid, len(chunk))
                     if pos >= end:
                         break
                 if pos < end:
