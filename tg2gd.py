@@ -65,6 +65,11 @@ load_dotenv()
 from aiohttp import web
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
+try:
+    from telethon.errors import FloodPremiumWaitError   # non-premium account throttle (GetFileRequest)
+except ImportError:
+    FloodPremiumWaitError = FloodWaitError
+FLOOD = (FloodWaitError, FloodPremiumWaitError)          # dono ko ek jaisa FloodWait maana jaayega
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -150,7 +155,7 @@ async def flood_safe(fn, who="", tries=10):
     for _ in range(tries):
         try:
             return await fn()
-        except FloodWaitError as e:
+        except FLOOD as e:
             log(f"[{who}] FloodWait {e.seconds}s - ruk raha hoon", "warn")
             for _ in range(e.seconds + 1):
                 if S["stop"]:
@@ -188,7 +193,7 @@ async def save_state(force=False, _retry=True):
             STATE_MSG_ID = m.id
         save_state.last = body
         S["state_ts"] = time.time()
-    except FloodWaitError as e:
+    except FLOOD as e:
         STATE_BLOCK[0] = time.time() + e.seconds + 1
         log(f"state save: FloodWait {e.seconds}s (baad me save hoga)", "warn")
     except Exception as e:
@@ -309,7 +314,7 @@ async def resolve_channel(client, spec, who=""):
         try:
             u = await client(ImportChatInviteRequest(val))
             return u.chats[0]
-        except FloodWaitError:
+        except FLOOD:
             raise
         except Exception as e:
             if "already" in str(e).lower():
@@ -318,7 +323,7 @@ async def resolve_channel(client, spec, who=""):
             raise
     try:
         return await client.get_entity(val)
-    except FloodWaitError:
+    except FLOOD:
         raise
     except Exception:
         await client.get_dialogs()
@@ -335,15 +340,16 @@ async def get_peer(client):
 
 # ------------------------------------------------------------------ account control
 async def acc_flood(a, secs):
-    a["floods"] += 1
-    a["status"] = "flood"
-    a["flood_until"] = time.time() + secs + 1
-    log(f"[{a['name']}] FloodWait {secs}s - ye account ruka, baaki chalte rahenge", "warn")
-    for _ in range(secs + 1):
-        if S["stop"]:
-            break
-        await asyncio.sleep(1)
-    if a["status"] == "flood":
+    """Account ko flood me daalo; uske saare connections saath me ruk kar ek hi baar wait karte hain."""
+    until = time.time() + secs + 1
+    if not (a["status"] == "flood" and a["flood_until"] >= until - 1):
+        a["floods"] += 1
+        a["status"] = "flood"
+        a["flood_until"] = max(a["flood_until"], until)
+        log(f"[{a['name']}] FloodWait {secs}s - ye account ruka, baaki chalte rahenge", "warn")
+    while time.time() < a["flood_until"] and not S["stop"]:
+        await asyncio.sleep(0.5)
+    if a["status"] == "flood" and time.time() >= a["flood_until"] - 0.5:
         a["status"] = "ok"
         a["flood_until"] = 0
 
@@ -416,7 +422,7 @@ async def download_msg(msg, size, path):
                 CUR_TASKS.clear()
                 pa["bytes"] -= base[0]
                 dl["done"] -= base[0]
-                if isinstance(e, FloodWaitError):
+                if isinstance(e, FLOOD):
                     flood_mark(pa, e.seconds)       # baaki accounts wali raah se aage badho
                     break
                 if is_dead(e):
@@ -476,7 +482,7 @@ async def download_msg(msg, size, path):
             try:
                 m = await fetch()
                 break
-            except FloodWaitError as e:
+            except FLOOD as e:
                 await acc_flood(a, e.seconds)
             except Exception as e:
                 if is_dead(e):
@@ -491,6 +497,9 @@ async def download_msg(msg, size, path):
             return
 
         while remaining[0] > 0 and not S["stop"] and not fatal and a["status"] != "dead":
+            if a["status"] == "flood":          # flood me naya segment mat uthao
+                await asyncio.sleep(0.5)
+                continue
             try:
                 i, tries = q.get_nowait()
             except asyncio.QueueEmpty:
@@ -527,7 +536,7 @@ async def download_msg(msg, size, path):
                 got = pos - start
                 a["bytes"] -= got
                 dl["done"] -= got
-                if isinstance(e, FloodWaitError):
+                if isinstance(e, FLOOD):
                     q.put_nowait((i, tries))
                     await acc_flood(a, e.seconds)
                 elif is_dead(e):
