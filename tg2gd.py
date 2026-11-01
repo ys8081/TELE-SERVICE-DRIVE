@@ -81,7 +81,16 @@ REQ = 1024 * 1024                # telegram request size
 STATE_TAG = "TG2GD_STATE"
 DEAD = {"AuthKeyUnregisteredError", "SessionRevokedError", "UserDeactivatedError",
         "UserDeactivatedBanError", "AuthKeyDuplicatedError", "SessionExpiredError"}
-os.makedirs(DATA_DIR, exist_ok=True)
+try:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    _t = os.path.join(DATA_DIR, ".w")
+    open(_t, "w").close()
+    os.remove(_t)
+except OSError:
+    import tempfile
+    print(f"[setup] DATA_DIR '{DATA_DIR}' use nahi ho sakta (disk nahi / permission) -> temp folder use hoga", flush=True)
+    DATA_DIR = os.path.join(tempfile.gettempdir(), "tg2gd")
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 
 def load_json(env, fname):
