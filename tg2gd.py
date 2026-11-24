@@ -4,6 +4,8 @@ Telegram -> (Render/PC disk) -> Google Drive   |  multi-account, resumable, live
 Features:
 - Full Channel mode (start msg ID se auto-scan + resumable)
 - File List / Queue mode (per-file Telegram links ya specific channel ki Msg ID range se list banakar upload)
+- CSV Import mode (id_link, NEW TITLE, PATH, TYPE, size_bytes wali CSV se auto subfolder tree + rename upload)
+- Per-Account Pause / Resume (kisi bhi account ko live pause/resume karo bina baaki accounts roke)
 - Google Drive Folder Picker & Creator Pop-up (link paste karna zaruri nahi, seedha Drive se select ya create karo)
 
 Chalane ke liye (Windows / Linux / Render):
@@ -15,7 +17,7 @@ Env (sab optional):
     PORT=8080  DATA_DIR=./data  APP_PASSWORD=808177  STATE_INTERVAL=3
     CONN=1 (har account ke max parallel connections)  MAX_MBPS=2 (har account ki max download speed, MB/s; 0 = unlimited)
 """
-import os, sys, re, json, time, asyncio, secrets, logging, collections, shutil, subprocess, importlib
+import os, sys, re, io, csv, json, time, asyncio, secrets, logging, collections, shutil, subprocess, importlib, threading
 
 
 def ensure_deps():
@@ -114,6 +116,17 @@ except OSError:
     DATA_DIR = os.path.join(tempfile.gettempdir(), "tg2gd")
     os.makedirs(DATA_DIR, exist_ok=True)
 
+JOB_STORE_FILE = os.path.join(DATA_DIR, "job_store.json")
+PAUSED_ACCS_FILE = os.path.join(DATA_DIR, "paused_accs.json")
+CSV_STAGED_FILE = os.path.join(DATA_DIR, "csv_staged.json")
+
+FOLDER_CACHE = {}
+FOLDER_LOCK = threading.Lock()
+
+
+class _AccPaused(Exception):
+    """Internal signal jab koi account mid-segment pause kiya jaaye."""
+
 
 def load_json(env, fname):
     v = os.environ.get(env)
@@ -132,6 +145,8 @@ S = {
     "status": "idle", "phase": "", "mode": "channel",
     "channel": "", "channel_title": "", "folder": "", "folder_name": "", "start_id": 0,
     "queue": [], "done_keys": [],
+    "csv_staged": {"filename": "", "items": [], "skipped": 0, "categories": {}, "folders_count": 0, "channels": [], "total_bytes": 0},
+    "csv_opts": {"use_path": True, "use_title": True, "cats": []},
     "last_done": 0, "done_count": 0, "total_bytes": 0,          # lifetime (saved messages me persist)
     "scan": {"files": 0, "bytes": 0},
     "plan": {"files": 0, "bytes": 0, "dl_files": 0, "dl_bytes": 0, "up_files": 0, "up_bytes": 0},
@@ -169,6 +184,63 @@ def is_dead(e):
     return type(e).__name__ in DEAD
 
 
+# ------------------------------------------------------------------ local disk persistence (large CSV + paused accs)
+def _write_json_atomic(path, data):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, separators=(",", ":"))
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _read_json_safe(path):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def save_local_job_store():
+    _write_json_atomic(JOB_STORE_FILE, {
+        "mode": S["mode"],
+        "channel": S["channel"],
+        "folder": S["folder"],
+        "folder_name": S["folder_name"],
+        "queue": S["queue"],
+        "done_keys": S["done_keys"],
+        "csv_opts": S["csv_opts"],
+        "last_done": S["last_done"],
+        "done_count": S["done_count"],
+        "total_bytes": S["total_bytes"],
+        "cur": cur_state["cur"],
+    })
+
+
+def save_paused_accs():
+    paused = [aid for aid, a in S["accs"].items() if a.get("paused")]
+    _write_json_atomic(PAUSED_ACCS_FILE, paused)
+
+
+def load_paused_accs():
+    data = _read_json_safe(PAUSED_ACCS_FILE)
+    return set(data) if isinstance(data, list) else set()
+
+
+def save_csv_staged():
+    _write_json_atomic(CSV_STAGED_FILE, S["csv_staged"])
+
+
+def load_csv_staged():
+    data = _read_json_safe(CSV_STAGED_FILE)
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        S["csv_staged"] = data
+
+
 async def flood_safe(fn, who="", tries=10):
     """Control-plane calls (messages fetch etc.) FloodWait par ruk kar dobara try karte hain."""
     for _ in range(tries):
@@ -195,6 +267,10 @@ def state_dict():
     if S["mode"] == "list":
         d["queue"] = S["queue"]
         d["done_keys"] = S["done_keys"]
+    elif S["mode"] == "csv":
+        d["csv_file"] = S["csv_staged"].get("filename", "")
+        d["csv_opts"] = S["csv_opts"]
+        d["done_keys"] = S["done_keys"][-120:]
     if len(json.dumps(d)) > 3800:           # telegram msg limit
         d["cur"] = None
     if len(json.dumps(d)) > 3800 and "done_keys" in d:
@@ -206,6 +282,7 @@ def state_dict():
 
 async def save_state(force=False, _retry=True):
     global STATE_MSG_ID
+    save_local_job_store()
     if not PRIMARY or time.time() < STATE_BLOCK[0]:
         return
     d = state_dict()
@@ -267,12 +344,25 @@ def safe_name(s):
     return re.sub(r"\s+", " ", s)[:150]
 
 
-def drive_name(msg):
+def clean_drive_segment(s):
+    """Google Drive folder/file name ke liye control chars hata kar clean karta hai (:, | wagairah Drive me valid hain)."""
+    s = re.sub(r"[\x00-\x1f\x7f]+", " ", str(s or ""))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:400]
+
+
+def drive_name(msg, custom_name=""):
     f = msg.file
     orig = (f.name or "") if f else ""
     ext = (f.ext or "") if f else ""
     if not ext and "." in orig:
         ext = "." + orig.rsplit(".", 1)[1]
+    if custom_name:
+        cn = clean_drive_segment(custom_name)
+        if cn:
+            if ext and not re.search(r"\.[A-Za-z0-9]{1,6}$", cn):
+                cn = cn + ext
+            return cn
     # poora caption (saari lines ek space se jud kar), jaisa hai waisa
     cap = re.sub(r"[\x00-\x1f\x7f]+", " ", msg.message or "")
     cap = re.sub(r"\s+", " ", cap).strip()
@@ -349,6 +439,153 @@ def parse_msg_link(url):
     return None
 
 
+def parse_csv_text(text, filename="upload.csv"):
+    """NEW_PC.csv jaise format (OLD TITLE, id_link, size_bytes, NEW TITLE, TYPE, TOPIC, RESOURCE NAME, PATH ...)
+    aur general Telegram-link CSV files ko parse karta hai."""
+    text = (text or "").lstrip("\ufeff")
+    reader = csv.DictReader(io.StringIO(text))
+    headers = [h for h in (reader.fieldnames or []) if h is not None]
+    if not headers:
+        raise ValueError("CSV me header row nahi mili")
+
+    def find_col(exact_names, contains_names=()):
+        # exact case-sensitive first
+        for cand in exact_names:
+            for h in headers:
+                if h.strip() == cand:
+                    return h
+        # exact case-insensitive
+        low_map = {h.strip().lower(): h for h in headers}
+        for cand in exact_names:
+            if cand.lower() in low_map:
+                return low_map[cand.lower()]
+        for sub in contains_names:
+            for h in headers:
+                if sub in h.strip().lower():
+                    return h
+        return None
+
+    col_link = find_col(["id_link", "link", "url", "telegram_link", "msg_link"], ["link", "url"])
+    col_new_title = find_col(["NEW TITLE", "new_title", "filename", "file_name", "name", "title"])
+    col_old_title = find_col(["OLD TITLE", "old_title"])
+    col_path = find_col(["PATH", "path", "folder_path", "dir", "folder"])
+    col_size = find_col(["size_bytes", "size", "bytes"])
+    # Note: CSV me 'type' (pdf/video) aur 'TYPE' (LECTURES/NOTES/DPP) dono ho sakte hain
+    col_cat = find_col(["TYPE", "category", "cat"])
+    if col_cat is None:
+        col_cat = find_col(["type"])
+    col_topic = find_col(["TOPIC", "topic", "chapter"])
+    col_res = find_col(["RESOURCE NAME", "resource_name", "subject"])
+    col_idx = find_col(["INDEX ID", "index_id", "index", "id"])
+
+    if not col_link:
+        raise ValueError("CSV me Telegram link column (jaise 'id_link') nahi mila")
+
+    items = []
+    skipped = 0
+    categories = collections.Counter()
+    folder_paths = set()
+    channels = []
+    ch_seen = set()
+    total_bytes = 0
+
+    for row in reader:
+        raw_link = (row.get(col_link) or "").strip()
+        parsed = parse_msg_link(raw_link)
+        if not parsed:
+            skipped += 1
+            continue
+        ch, mid = parsed
+        if ch not in ch_seen:
+            ch_seen.add(ch)
+            channels.append(ch)
+
+        new_title = clean_drive_segment(row.get(col_new_title) or "") if col_new_title else ""
+        if not new_title and col_old_title:
+            new_title = clean_drive_segment(row.get(col_old_title) or "")
+
+        raw_path = (row.get(col_path) or "").strip() if col_path else ""
+        folder_parts = []
+        if raw_path:
+            parts = [clean_drive_segment(p) for p in re.split(r"[/\\]+", raw_path) if p.strip()]
+            if parts:
+                last = parts[-1]
+                has_ext = bool(re.search(r"\.[A-Za-z0-9]{1,6}$", last))
+                if len(parts) >= 2 and (has_ext or (new_title and last == new_title)):
+                    folder_parts = parts[:-1]
+                    if not new_title:
+                        new_title = last
+                elif len(parts) == 1 and has_ext:
+                    if not new_title:
+                        new_title = last
+                else:
+                    folder_parts = parts
+
+        if folder_parts:
+            folder_paths.add("/".join(folder_parts))
+
+        sz = 0
+        if col_size:
+            raw_sz = str(row.get(col_size) or "").strip().replace(",", "")
+            if raw_sz.isdigit():
+                sz = int(raw_sz)
+        total_bytes += sz
+
+        cat = (row.get(col_cat) or "").strip() if col_cat else ""
+        if cat:
+            categories[cat] += 1
+        topic = (row.get(col_topic) or "").strip() if col_topic else ""
+        res_name = (row.get(col_res) or "").strip() if col_res else ""
+        idx_id = (row.get(col_idx) or "").strip() if col_idx else ""
+
+        items.append({
+            "kind": "csv",
+            "channel": ch,
+            "msg_id": mid,
+            "name": new_title,
+            "folder_parts": folder_parts,
+            "size_hint": sz,
+            "cat": cat,
+            "topic": topic,
+            "resource": res_name,
+            "index_id": idx_id,
+        })
+
+    if not items:
+        raise ValueError("CSV me koi valid Telegram link nahi mila")
+
+    return {
+        "filename": filename or "upload.csv",
+        "items": items,
+        "skipped": skipped,
+        "categories": dict(categories),
+        "folders_count": len(folder_paths),
+        "channels": channels,
+        "total_bytes": total_bytes,
+    }
+
+
+def csv_summary_view(staged):
+    items = staged.get("items") or []
+    return {
+        "filename": staged.get("filename", ""),
+        "total": len(items),
+        "skipped": staged.get("skipped", 0),
+        "categories": staged.get("categories", {}),
+        "folders_count": staged.get("folders_count", 0),
+        "channels": staged.get("channels", []),
+        "total_bytes": staged.get("total_bytes", 0),
+        "preview": [{
+            "index_id": it.get("index_id", ""),
+            "msg_id": it.get("msg_id", 0),
+            "name": it.get("name", ""),
+            "folder": "/".join(it.get("folder_parts") or []),
+            "size_hint": it.get("size_hint", 0),
+            "cat": it.get("cat", ""),
+        } for it in items[:80]],
+    }
+
+
 def normalize_queue(raw_queue):
     """Frontend se aayi queue ko validate/normalize karta hai."""
     out = []
@@ -356,7 +593,7 @@ def normalize_queue(raw_queue):
         if not isinstance(it, dict):
             continue
         kind = it.get("kind")
-        if kind == "link":
+        if kind in ("link", "csv"):
             ch = str(it.get("channel") or "").strip()
             mid = int(it.get("msg_id") or 0)
             if (not ch or mid <= 0) and it.get("raw"):
@@ -364,7 +601,14 @@ def normalize_queue(raw_queue):
                 if parsed:
                     ch, mid = parsed
             if ch and mid > 0:
-                out.append({"kind": "link", "channel": ch, "msg_id": mid})
+                entry = {"kind": kind, "channel": ch, "msg_id": mid}
+                if kind == "csv":
+                    entry["name"] = str(it.get("name") or "")
+                    entry["folder_parts"] = [str(p) for p in (it.get("folder_parts") or []) if str(p).strip()]
+                    entry["size_hint"] = int(it.get("size_hint") or 0)
+                    entry["cat"] = str(it.get("cat") or "")
+                    entry["index_id"] = str(it.get("index_id") or "")
+                out.append(entry)
         elif kind == "range":
             ch = str(it.get("channel") or "").strip()
             s_id = int(it.get("start_id") or 0)
@@ -465,16 +709,48 @@ def acc_dead(a, e):
     log(f"[{a['name']}] session DEAD ({type(e).__name__}) - ye account hata diya", "err")
 
 
+def set_account_paused(aid, paused):
+    """Kisi ek account ko pause ya resume karta hai."""
+    if aid not in S["accs"]:
+        return False, "Account nahi mila"
+    a = S["accs"][aid]
+    if a["status"] == "dead":
+        return False, f"{a['name']} dead hai"
+    new_val = bool(paused)
+    if a["paused"] != new_val:
+        a["paused"] = new_val
+        if new_val:
+            a["speed"] = 0
+        log(f"[{a['name']}] {'PAUSED (download/upload se roka gaya)' if new_val else 'RESUMED (wapas active)'}",
+            "warn" if new_val else "ok")
+        save_paused_accs()
+    return True, ""
+
+
+def pick_unpaused_client():
+    """Photo ya single-client download ke liye koi bhi active (non-dead, non-paused) client chunta hai."""
+    if PRIMARY_AID and S["accs"].get(PRIMARY_AID, {}).get("status") == "ok" and not S["accs"][PRIMARY_AID]["paused"]:
+        return PRIMARY_AID, PRIMARY
+    for aid, cl in CLIENTS.items():
+        a = S["accs"][aid]
+        if a["status"] != "dead" and not a["paused"]:
+            return aid, cl
+    return None, None
+
+
 # ------------------------------------------------------------------ speed limiter (per account)
 async def throttle(aid, n):
     """Is account ki total download speed MAX_BPS se upar nahi jaane deta."""
     if MAX_BPS <= 0 or n <= 0:
         return
+    a = S["accs"].get(aid)
     now = time.monotonic()
     nxt = max(_NEXT.get(aid, 0), now) + n / MAX_BPS
     _NEXT[aid] = nxt
     d = nxt - now
     while d > 0 and not S["stop"]:
+        if a and a.get("paused"):
+            raise _AccPaused()
         await asyncio.sleep(min(d, 0.5))
         d -= 0.5
 
@@ -486,20 +762,36 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
     eid = ent_id if ent_id is not None else S.get("_ent_id")
     ch_spec = channel_spec if channel_spec is not None else S["channel"]
 
-    # photo: chhoti file, seedha primary se
+    # photo: chhoti file, kisi bhi unpaused account se (agar sab paused hon to wait)
     if msg.photo and not msg.document:
-        await flood_safe(lambda: PRIMARY.download_media(msg, file=path), "primary")
+        while not S["stop"]:
+            aid, cl = pick_unpaused_client()
+            if cl is not None:
+                break
+            await asyncio.sleep(0.5)
+        if S["stop"]:
+            return None
+        who = S["accs"][aid]["name"]
+        if cl is PRIMARY:
+            await flood_safe(lambda: cl.download_media(msg, file=path), who)
+        else:
+            peer = await get_peer(cl, eid, ch_spec)
+            m2 = await flood_safe(lambda: cl.get_messages(peer, ids=msg.id), who)
+            await flood_safe(lambda: cl.download_media(m2, file=path), who)
         real = os.path.getsize(path)
-        await throttle(PRIMARY_AID, real)
+        try:
+            await throttle(aid, real)
+        except _AccPaused:
+            pass
         dl.update(done=real, size=real, nseg=1, segs_done=1)
-        CUR_OWNER[0] = bytearray([S["accs"][PRIMARY_AID]["idx"] + 1])
-        S["accs"][PRIMARY_AID]["bytes"] += real
+        CUR_OWNER[0] = bytearray([S["accs"][aid]["idx"] + 1])
+        S["accs"][aid]["bytes"] += real
         return real
 
     if PRIMARY_SMALL and size <= SEG:    # chhoti file: sirf primary se (default band, sab barabar)
         pa = S["accs"][PRIMARY_AID]
         for attempt in range(3):
-            if pa["status"] != "ok":
+            if pa["status"] != "ok" or pa["paused"]:
                 break
             cur_state["cur"] = None
             CUR_OWNER[0] = bytearray([pa["idx"] + 1])
@@ -507,6 +799,8 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
             base = [0]
 
             def cb(rec, tot):
+                if pa["paused"]:
+                    raise _AccPaused()
                 d = rec - base[0]
                 base[0] = rec
                 pa["bytes"] += d
@@ -523,6 +817,11 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
                 dl.update(done=real, segs_done=1)
                 await throttle(PRIMARY_AID, real)
                 return real
+            except _AccPaused:
+                CUR_TASKS.clear()
+                pa["bytes"] -= base[0]
+                dl["done"] -= base[0]
+                break
             except asyncio.CancelledError:
                 CUR_TASKS.clear()
                 if S["stop"]:
@@ -577,8 +876,6 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
     async def worker(aid, client):
         a = S["accs"][aid]
         m = None
-        while a["status"] == "flood" and remaining[0] > 0 and not S["stop"]:
-            await asyncio.sleep(1)
 
         async def fetch():
             peer = await get_peer(client, eid, ch_spec)
@@ -587,30 +884,34 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
                 raise RuntimeError("msg nahi mila (account channel me hai?)")
             return r
 
-        for attempt in range(6):
-            if S["stop"] or fatal:
-                return
-            try:
-                m = await fetch()
-                break
-            except FLOOD as e:
-                await acc_flood(a, e.seconds)
-            except Exception as e:
-                if is_dead(e):
-                    acc_dead(a, e)
-                    return
-                a["errors"] += 1
-                a["last_err"] = str(e)[:90]
-                log(f"[{a['name']}] msg fetch fail: {e}", "err")
-                await asyncio.sleep(2)
-        if m is None:
-            log(f"[{a['name']}] is file me madad nahi kar paya - skip", "warn")
-            return
-
         while remaining[0] > 0 and not S["stop"] and not fatal and a["status"] != "dead":
-            if a["status"] == "flood":          # flood me naya segment mat uthao
+            if a["status"] == "flood" or a["paused"]:     # flood ya pause me kuch mat uthao
                 await asyncio.sleep(0.5)
                 continue
+            if m is None:
+                fetched = False
+                for attempt in range(6):
+                    if S["stop"] or fatal or a["paused"] or a["status"] == "dead":
+                        break
+                    try:
+                        m = await fetch()
+                        fetched = True
+                        break
+                    except FLOOD as e:
+                        await acc_flood(a, e.seconds)
+                    except Exception as e:
+                        if is_dead(e):
+                            acc_dead(a, e)
+                            return
+                        a["errors"] += 1
+                        a["last_err"] = str(e)[:90]
+                        log(f"[{a['name']}] msg fetch fail: {e}", "err")
+                        await asyncio.sleep(2)
+                if a["paused"]:
+                    continue
+                if not fetched or m is None:
+                    log(f"[{a['name']}] is file me madad nahi kar paya - skip", "warn")
+                    return
             try:
                 i, tries = q.get_nowait()
             except asyncio.QueueEmpty:
@@ -623,6 +924,10 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
                 async for chunk in client.iter_download(
                         m.media, offset=start, limit=(end - start + REQ - 1) // REQ,
                         request_size=REQ, file_size=size):
+                    if a["paused"]:
+                        raise _AccPaused()
+                    if S["stop"]:
+                        return
                     chunk = bytes(chunk)[: end - pos]
                     async with wlock:
                         fh.seek(pos)
@@ -644,6 +949,12 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
                 a["segs"] += 1
                 remaining[0] -= 1
                 dl["segs_done"] += 1
+            except _AccPaused:
+                got = pos - start
+                a["bytes"] -= got
+                dl["done"] -= got
+                q.put_nowait((i, tries))
+                continue
             except Exception as e:
                 got = pos - start
                 a["bytes"] -= got
@@ -700,6 +1011,46 @@ def drive_service():
     if not creds.valid:
         creds.refresh(Request())
     return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def ensure_drive_path_sync(root_folder, folder_parts):
+    """Google Drive me root_folder ke andar nested folder_parts (jaise ['Batch', 'Subject', 'Ch 01', 'NOTES'])
+    ko dhoondhta ya create karta hai (duplicate nahi banata, cache use karta hai)."""
+    cur_parent = (root_folder or "").strip() or "root"
+    if not folder_parts:
+        return "" if cur_parent == "root" else cur_parent
+    svc = None
+    with FOLDER_LOCK:
+        for raw_seg in folder_parts:
+            seg = clean_drive_segment(raw_seg)
+            if not seg:
+                continue
+            key = (cur_parent, seg)
+            if key in FOLDER_CACHE:
+                cur_parent = FOLDER_CACHE[key]
+                continue
+            if svc is None:
+                svc = drive_service()
+            safe_q = seg.replace("\\", "\\\\").replace("'", "\\'")
+            q = (f"mimeType = 'application/vnd.google-apps.folder' and trashed = false "
+                 f"and name = '{safe_q}' and '{cur_parent}' in parents")
+            res = svc.files().list(
+                q=q, spaces="drive", fields="files(id,name)", pageSize=5,
+                includeItemsFromAllDrives=True, supportsAllDrives=True,
+            ).execute()
+            found = res.get("files", [])
+            if found:
+                fid = found[0]["id"]
+            else:
+                meta = {"name": seg, "mimeType": "application/vnd.google-apps.folder"}
+                if cur_parent != "root":
+                    meta["parents"] = [cur_parent]
+                created = svc.files().create(body=meta, fields="id,name", supportsAllDrives=True).execute()
+                fid = created["id"]
+                log(f"Drive subfolder banaya: {seg}", "ok")
+            FOLDER_CACHE[key] = fid
+            cur_parent = fid
+    return "" if cur_parent == "root" else cur_parent
 
 
 def drive_list_folders_sync(parent="root", scope="mydrive", search=""):
@@ -857,19 +1208,24 @@ def upload_blocking(path, name, folder, ul):
             raise RuntimeError(f"drive upload {code}: {r.text[:200]}")
 
 
-async def upload_file(msg_id, path, name, size):
-    ul = {"id": msg_id, "name": name, "size": size, "done": 0, "speed": 0}
+async def upload_file(msg_id, path, name, size, folder_parts=None):
+    target_folder = S["folder"]
+    if folder_parts:
+        target_folder = await asyncio.to_thread(ensure_drive_path_sync, S["folder"], folder_parts)
+    ul = {"id": msg_id, "name": name, "size": size, "done": 0, "speed": 0,
+          "folder": "/".join(folder_parts) if folder_parts else ""}
     S["ul"] = ul
     try:
-        r = await asyncio.to_thread(upload_blocking, path, name, S["folder"], ul)
+        r = await asyncio.to_thread(upload_blocking, path, name, target_folder, ul)
     finally:
         S["ul"] = None
     if r:
-        log(f"Drive OK: {name}", "ok")
+        prefix = f"{'/'.join(folder_parts)}/" if folder_parts else ""
+        log(f"Drive OK: {prefix}{name}", "ok")
     return bool(r)
 
 
-# ------------------------------------------------------------------ job (channel mode + file list mode)
+# ------------------------------------------------------------------ job (channel mode + file list + csv mode)
 async def scan_channel(ent, min_id):
     S["phase"] = "scanning"
     items, cursor, total = [], min_id, 0
@@ -890,9 +1246,8 @@ async def scan_channel(ent, min_id):
 
 
 async def scan_queue_list(queue):
-    """File list (per-file links + channel msg ID ranges) ko scan karke downloadable items banata hai.
-    Returns: (items, ents_by_spec)
-      items: list of dicts {"ch_spec", "ent", "ent_id", "msg_id", "size", "key"}
+    """File list / CSV entries ko scan karke downloadable items banata hai.
+    Returns: list of dicts {"ch_spec", "ent", "ent_id", "msg_id", "size", "key", "custom_name", "folder_parts"}
     """
     S["phase"] = "scanning"
     S["scan"] = {"files": 0, "bytes": 0}
@@ -909,7 +1264,8 @@ async def scan_queue_list(queue):
             t = getattr(ent, "title", "") or str(ent.id)
             if t not in titles:
                 titles.append(t)
-    S["channel_title"] = f"List ({len(titles)} ch: {', '.join(titles[:2])}{'…' if len(titles) > 2 else ''})"
+    tag = f"CSV ({S['csv_staged'].get('filename') or 'batch'})" if S["mode"] == "csv" else "List"
+    S["channel_title"] = f"{tag} · {', '.join(titles[:2])}{'…' if len(titles) > 2 else ''}"
 
     for ch in unique_specs:
         ent = ents[ch]
@@ -929,24 +1285,29 @@ async def scan_queue_list(queue):
                     a["last_err"] = str(e)[:90]
                     log(f"[{a['name']}] channel resolve fail ({ch}): {e}", "err")
 
-    # 2. Queue items ko expand karke (ch_spec, msg_id) pairs banao (order preserve, dedupe)
+    # 2. Queue items ko expand karke (ch_spec, [(msg_id, meta), ...]) runs banao (order preserve, dedupe)
     done_set = set(S["done_keys"])
     seen = set()
-    wanted_runs = []   # list of (ch_spec, [msg_id, ...]) preserving user order
+    wanted_runs = []   # list of (ch_spec, [(msg_id, custom_name, folder_parts), ...])
+    use_path = S["csv_opts"].get("use_path", True) if S["mode"] == "csv" else False
+    use_title = S["csv_opts"].get("use_title", True) if S["mode"] == "csv" else False
+
     for it in queue:
         ch = it["channel"]
         ent = ents[ch]
-        if it["kind"] == "link":
-            mids = [it["msg_id"]]
+        if it["kind"] in ("link", "csv"):
+            cname = (it.get("name") or "") if (it["kind"] == "csv" and use_title) else ""
+            fparts = (it.get("folder_parts") or []) if (it["kind"] == "csv" and use_path) else []
+            entries = [(it["msg_id"], cname, fparts)]
         else:
-            mids = list(range(it["start_id"], it["end_id"] + 1))
+            entries = [(mid, "", []) for mid in range(it["start_id"], it["end_id"] + 1)]
         filtered = []
-        for mid in mids:
+        for mid, cname, fparts in entries:
             key = f"{ent.id}:{mid}"
             if key in seen or key in done_set:
                 continue
             seen.add(key)
-            filtered.append(mid)
+            filtered.append((mid, cname, fparts))
         if not filtered:
             continue
         if wanted_runs and wanted_runs[-1][0] == ch:
@@ -956,22 +1317,25 @@ async def scan_queue_list(queue):
 
     # 3. Har run ke messages 100-100 ke batch me fetch karke media files filter karo
     items, total = [], 0
-    for ch, mids in wanted_runs:
+    for ch, entries in wanted_runs:
         if S["stop"]:
             break
         ent = ents[ch]
-        for i in range(0, len(mids), 100):
+        for i in range(0, len(entries), 100):
             if S["stop"]:
                 break
-            batch_ids = mids[i:i + 100]
+            chunk = entries[i:i + 100]
+            batch_ids = [x[0] for x in chunk]
             msgs = await flood_safe(lambda e=ent, b=batch_ids: PRIMARY.get_messages(e, ids=b), "primary")
             if not isinstance(msgs, list):
                 msgs = [msgs]
-            for m in msgs:
+            for idx_m, m in enumerate(msgs):
+                _, cname, fparts = chunk[idx_m]
                 if m and m.media and m.file and m.file.size:
                     items.append({
                         "ch_spec": ch, "ent": ent, "ent_id": ent.id,
                         "msg_id": m.id, "size": m.file.size, "key": f"{ent.id}:{m.id}",
+                        "custom_name": cname, "folder_parts": fparts,
                     })
                     total += m.file.size
             S["scan"] = {"files": len(items), "bytes": total}
@@ -997,16 +1361,16 @@ async def run_once():
                 except OSError:
                     pass
 
-        if S["mode"] == "list":
+        if S["mode"] in ("list", "csv"):
             if not S["queue"]:
-                raise RuntimeError("File list khaali hai — pehle link ya msg ID range add karo")
-            log(f"list mode: {len(S['queue'])} entries scan ho rahi hain", "ok")
+                raise RuntimeError("Queue khaali hai — pehle links, range ya CSV upload karo")
+            log(f"{S['mode']} mode: {len(S['queue'])} entries scan ho rahi hain", "ok")
             list_items = await scan_queue_list(S["queue"])
             S["plan"] = {"files": len(list_items), "bytes": sum(x["size"] for x in list_items),
                          "dl_files": 0, "dl_bytes": 0, "up_files": 0, "up_bytes": 0}
             S["started_at"] = time.time()
             S["ended_at"] = 0
-            log(f"list scan done: {len(list_items)} files, {fmt(S['plan']['bytes'])}", "ok")
+            log(f"{S['mode']} scan done: {len(list_items)} files, {fmt(S['plan']['bytes'])}", "ok")
         else:
             ent = await flood_safe(lambda: resolve_channel(PRIMARY, S["channel"], "primary"), "primary")
             S["_ent_id"] = ent.id
@@ -1030,6 +1394,7 @@ async def run_once():
             list_items = [{
                 "ch_spec": S["channel"], "ent": ent, "ent_id": ent.id,
                 "msg_id": mid, "size": sz, "key": f"{ent.id}:{mid}",
+                "custom_name": "", "folder_parts": [],
             } for mid, sz in raw_items]
             S["plan"] = {"files": len(list_items), "bytes": sum(x["size"] for x in list_items),
                          "dl_files": 0, "dl_bytes": 0, "up_files": 0, "up_bytes": 0}
@@ -1042,15 +1407,15 @@ async def run_once():
                 it = await upq.get()
                 if it is None:
                     return
-                msg_id, path, name, size, key = it
+                msg_id, path, name, size, key, folder_parts = it
                 try:
-                    ok = await upload_file(msg_id, path, name, size)
+                    ok = await upload_file(msg_id, path, name, size, folder_parts=folder_parts)
                     if ok:
                         try:
                             os.remove(path)
                         except OSError:
                             pass
-                        if S["mode"] == "list":
+                        if S["mode"] in ("list", "csv"):
                             if key not in S["done_keys"]:
                                 S["done_keys"].append(key)
                         else:
@@ -1093,13 +1458,15 @@ async def run_once():
                     S["plan"]["files"] = max(0, S["plan"]["files"] - 1)
                     continue
                 size = msg.file.size
-                name = drive_name(msg)
-                part_name = f"{meta['ent_id']}_{msg.id}.part" if S["mode"] == "list" else f"{msg.id}.part"
+                name = drive_name(msg, custom_name=meta.get("custom_name", ""))
+                part_name = f"{meta['ent_id']}_{msg.id}.part" if S["mode"] in ("list", "csv") else f"{msg.id}.part"
                 path = os.path.join(DATA_DIR, part_name)
                 pos = idx + k
-                S["next"] = [{"id": x["msg_id"], "size": x["size"]} for x in list_items[pos + 1:pos + 6]]
+                S["next"] = [{"id": x["msg_id"], "size": x["size"], "name": x.get("custom_name", "")}
+                             for x in list_items[pos + 1:pos + 6]]
                 S["dl"] = {"id": msg.id, "name": name, "size": size, "done": 0, "speed": 0,
-                           "nseg": 0, "segs_done": 0, "start": time.time()}
+                           "nseg": 0, "segs_done": 0, "start": time.time(),
+                           "folder": "/".join(meta.get("folder_parts") or [])}
                 log(f"#{msg.id}  {name}  ({fmt(size)})")
                 real = await download_msg(msg, size, path, ent_id=meta["ent_id"], channel_spec=ch_spec)
                 if real is None:
@@ -1107,7 +1474,7 @@ async def run_once():
                 S["plan"]["dl_files"] += 1
                 S["plan"]["dl_bytes"] += real
                 S["dl"] = None
-                await upq.put((msg.id, path, name, real, meta["key"]))
+                await upq.put((msg.id, path, name, real, meta["key"], meta.get("folder_parts") or []))
             idx = end_idx
 
         S["next"] = []
@@ -1178,9 +1545,12 @@ async def speed_loop():
         for k, v in S["accs"].items():
             sp = (v["bytes"] - last.get(k, v["bytes"])) / dt
             last[k] = v["bytes"]
-            v["speed"] = max(0, 0.5 * v["speed"] + 0.5 * sp)
-            if v["speed"] < 1:
+            if v.get("paused") or v["status"] == "dead":
                 v["speed"] = 0
+            else:
+                v["speed"] = max(0, 0.5 * v["speed"] + 0.5 * sp)
+                if v["speed"] < 1:
+                    v["speed"] = 0
             tot += v["speed"]
         S["speed"] = tot
         S["hist"].append(int(tot))
@@ -1210,13 +1580,24 @@ def status_json():
     rate = (avg + recent) / 2 if avg > 0 and recent > 0 else (avg or recent)
     eta = rem_bytes / rate if rate > 0 and S["status"] == "running" else 0
     accs = []
-    for a in S["accs"].values():
-        accs.append({**a, "flood_left": max(0, int(a["flood_until"] - now)) if a["status"] == "flood" else 0})
+    alive_cnt = 0
+    paused_cnt = 0
+    for aid, a in S["accs"].items():
+        if a["status"] != "dead":
+            alive_cnt += 1
+            if a.get("paused"):
+                paused_cnt += 1
+        accs.append({**a, "id": aid, "flood_left": max(0, int(a["flood_until"] - now)) if a["status"] == "flood" else 0})
+    all_paused = alive_cnt > 0 and paused_cnt == alive_cnt
     return {
-        "status": S["status"], "phase": S["phase"], "mode": S["mode"],
+        "status": S["status"], "phase": ("all accounts paused" if (S["status"] == "running" and all_paused) else S["phase"]),
+        "mode": S["mode"],
         "stopping": bool(S["stop"] and S["status"] == "running"),
+        "all_paused": all_paused,
         "channel": S["channel"], "folder": S["folder"], "folder_name": S["folder_name"],
-        "queue": S["queue"],
+        "queue": S["queue"] if S["mode"] == "list" else [],
+        "csv_info": csv_summary_view(S["csv_staged"]) if S["csv_staged"].get("items") else None,
+        "csv_opts": S["csv_opts"],
         "channel_title": S["channel_title"], "last_done": S["last_done"],
         "done_count": S["done_count"], "total_bytes": S["total_bytes"],
         "scan": S["scan"], "plan": p, "elapsed": elapsed, "avg": avg, "eta": eta,
@@ -1259,9 +1640,9 @@ h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.2px}h1 span{color:var
 .offline.show{display:block}
 .tabpane{display:none}.tabpane.on{display:block}
 .card{background:var(--card);border:1px solid var(--b);border-radius:14px;padding:14px 16px;margin-bottom:12px;min-width:0}
-.card h3{white-space:nowrap;gap:10px;margin:0 0 10px;font-size:11px;font-weight:600;color:var(--m);text-transform:uppercase;letter-spacing:.8px;display:flex;justify-content:space-between;align-items:center}
-.modebar{display:grid;grid-template-columns:1fr 1fr;gap:6px;background:var(--card2);border:1px solid var(--b);border-radius:11px;padding:4px;margin-bottom:12px}
-.modebar button{background:none;color:var(--m);padding:9px 10px;font-size:13px;border-radius:8px;font-weight:600}
+.card h3{white-space:nowrap;gap:10px;margin:0 0 10px;font-size:11px;font-weight:600;color:var(--m);text-transform:uppercase;letter-spacing:.8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}
+.modebar{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;background:var(--card2);border:1px solid var(--b);border-radius:11px;padding:4px;margin-bottom:12px}
+.modebar button{background:none;color:var(--m);padding:9px 8px;font-size:12.5px;border-radius:8px;font-weight:600}
 .modebar button.on{background:var(--ac);color:#fff}
 .ctl{display:grid;grid-template-columns:1fr;gap:10px}
 label{font-size:11.5px;color:var(--m);display:block;margin-bottom:5px}
@@ -1276,9 +1657,11 @@ button.stop{background:#2a3550}button.stop:not(:disabled):active{background:var(
 button.sec{background:var(--card2);border:1px solid var(--b);color:var(--t)}
 button.sec:hover{border-color:var(--ac)}
 button.sm{padding:8px 12px;font-size:12.5px;border-radius:8px}
+button.xs{padding:5px 10px;font-size:11.5px;border-radius:7px}
 button.okbtn{background:#187d44}
+button.wabtn{background:#3a2d10;border:1px solid #6e5420;color:var(--wa)}
 .btns{display:flex;gap:8px;flex-wrap:wrap}.btns button{flex:1}
-.fresh{display:flex;align-items:center;gap:7px;margin:2px 0 0;white-space:nowrap;font-size:12.5px}.fresh input{width:auto}
+.fresh{display:flex;align-items:center;gap:7px;margin:2px 0 0;white-space:nowrap;font-size:12.5px;cursor:pointer}.fresh input{width:auto}
 .fo-row{display:flex;gap:8px;align-items:stretch}
 .fo-row input{flex:1;min-width:0}
 .fo-row button{flex:none;white-space:nowrap}
@@ -1299,6 +1682,21 @@ button.okbtn{background:#187d44}
 .qitem .qt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t)}
 .qitem .del{background:none;color:var(--m);padding:2px 7px;font-size:14px;border-radius:6px;flex:none}
 .qitem .del:hover{background:#3a1519;color:var(--er)}
+.csv-drop{border:1.5px dashed #2a3e66;border-radius:11px;background:var(--card2);padding:18px 14px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s}
+.csv-drop:hover,.csv-drop.drag{border-color:var(--ac);background:#101d33}
+.csv-drop p{margin:6px 0 0;font-size:13px;color:var(--t);font-weight:600}
+.csv-drop small{display:block;margin-top:3px;color:var(--m);font-size:11.5px}
+.csv-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.csv-pill{background:var(--card2);border:1px solid var(--b);border-radius:8px;padding:4px 10px;font-size:12px;color:var(--t)}
+.csv-pill b{color:var(--ac)}
+.csv-cats{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.csv-cat{padding:5px 10px;font-size:11.5px;border-radius:8px;background:var(--card2);border:1px solid var(--b);color:var(--m);font-weight:600}
+.csv-cat.on{background:#152a4a;border-color:var(--ac);color:#fff}
+.csv-opts{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}
+.csv-prev{margin-top:10px;max-height:200px;overflow:auto;background:var(--card2);border:1px solid var(--b);border-radius:10px;padding:6px;display:flex;flex-direction:column;gap:5px}
+.csv-row{background:var(--card);border:1px solid var(--b);border-radius:8px;padding:6px 9px;font-size:12px}
+.csv-row .ct{font-weight:600;color:var(--t);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.csv-row .cp{font-size:11px;color:var(--m);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
 .st{background:var(--card);border:1px solid var(--b);border-radius:12px;padding:11px 13px}
 .st small{display:block;color:var(--m);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px}
@@ -1310,21 +1708,25 @@ button.okbtn{background:#187d44}
 .two{display:grid;grid-template-columns:1fr;gap:12px;margin-bottom:12px}.two>.card{margin-bottom:0}
 canvas{display:block;width:100%}
 #map{margin-top:10px;border-radius:6px}
-.accs{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
-.ac{background:var(--card2);border:1px solid var(--b);border-radius:11px;padding:11px 12px}
+.ac-head-r{display:inline-flex;align-items:center;gap:6px;flex-wrap:wrap}
+.accs{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:10px}
+.ac{background:var(--card2);border:1px solid var(--b);border-radius:11px;padding:11px 12px;transition:opacity .2s,border-color .2s}
+.ac.paused{border-color:#6e5420;opacity:.78}
 .ac .h{display:flex;align-items:center;gap:8px;margin-bottom:6px}.dot{width:10px;height:10px;border-radius:3px;flex:none}
 .ac .n{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ac .ph{color:var(--m);font-size:11px}
 .chip{margin-left:auto;font-size:10px;font-weight:700;padding:2px 8px;border-radius:99px;text-transform:uppercase;letter-spacing:.4px;background:#10331f;color:var(--ok);white-space:nowrap}
-.chip.flood{background:#3a2d10;color:var(--wa)}.chip.dead{background:#3a1519;color:var(--er)}.chip.idle{background:#1a2438;color:var(--m)}
+.chip.flood{background:#3a2d10;color:var(--wa)}.chip.dead{background:#3a1519;color:var(--er)}.chip.idle{background:#1a2438;color:var(--m)}.chip.paused{background:#3a2d10;color:var(--wa)}
 .ac .sp{font-size:18px;font-weight:700;margin:2px 0 6px;font-variant-numeric:tabular-nums}
 .ac .er{color:var(--er);font-size:11px;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ac .act{margin-top:9px}
+.ac .act button{width:100%;padding:7px 10px;font-size:12px;border-radius:8px}
 .logtools{display:flex;gap:8px;margin-bottom:8px}
 .logtools input{flex:1;padding:9px 11px;font-size:13px}
 .logtools button{padding:9px 12px;font-size:12px;background:var(--card2);border:1px solid var(--b);color:var(--t)}
 #log{height:calc(100vh - 230px);min-height:260px;overflow:auto;background:#080b12;border-radius:9px;padding:9px 11px;font:12px/1.65 ui-monospace,Consolas,monospace;color:#9db0cf}
 #log b{color:#5a6c8c;font-weight:400;margin-right:8px}#log .ok{color:var(--ok)}#log .warn{color:var(--wa)}#log .err{color:var(--er)}
 #log .hit{background:#1a2438}
-.nx{display:flex;gap:8px;flex-wrap:wrap}.nx span{background:var(--card2);border:1px solid var(--b);border-radius:8px;padding:3px 9px;font-size:12px;color:var(--m)}
+.nx{display:flex;gap:8px;flex-wrap:wrap}.nx span{background:var(--card2);border:1px solid var(--b);border-radius:8px;padding:3px 9px;font-size:12px;color:var(--m);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:20;display:grid;grid-template-columns:repeat(4,1fr);background:rgba(17,24,38,.96);backdrop-filter:blur(10px);border-top:1px solid var(--b);padding-bottom:var(--sab)}
 nav.tabs button{background:none;color:var(--m);border-radius:0;padding:9px 2px 8px;font-size:10.5px;font-weight:600;display:flex;flex-direction:column;align-items:center;gap:3px;letter-spacing:.2px}
 nav.tabs button .ic{font-size:18px;line-height:1}
@@ -1413,7 +1815,8 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
 <div class=card>
   <div class=modebar>
     <button id=m_ch class=on onclick="setMode('channel')"><svg class="ico" viewBox="0 0 24 24"><path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/><circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/><path d="M19.1 4.9C23 8.8 23 15.1 19.1 19"/></svg> Full Channel</button>
-    <button id=m_ls onclick="setMode('list')"><svg class="ico" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> File List / Queue</button>
+    <button id=m_ls onclick="setMode('list')"><svg class="ico" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg> File List</button>
+    <button id=m_csv onclick="setMode('csv')"><svg class="ico" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/><line x1="12" y1="9" x2="12" y2="19"/></svg> CSV Import</button>
   </div>
 
   <!-- Shared Drive Destination -->
@@ -1457,6 +1860,29 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
     <div id=qlist class=qlist><div class=qempty>Koi file nahi hai — upar se links ya msg ID range add karo</div></div>
   </div>
 
+  <!-- Mode 3: CSV Import -->
+  <div id=box_csv class=hide style="margin-bottom:10px">
+    <input type=file id=in_csv accept=".csv,text/csv" class=hide onchange="onCsvPick(this.files[0])">
+    <div id=csv_drop class=csv-drop onclick="$('in_csv').click()">
+      <svg class="ico ico-lg" style="color:var(--ac)" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+      <p id=csv_drop_lbl>CSV file choose karo ya yahan drag &amp; drop karo</p>
+      <small>Supports: id_link, NEW TITLE, PATH, TYPE, size_bytes, INDEX ID</small>
+    </div>
+    <div id=csv_body class=hide>
+      <div class=qlist-head style="margin-top:10px">
+        <span id=csv_fname style="color:var(--t);font-weight:600"></span>
+        <button type=button class="sec xs" onclick=clearCsv()>Clear CSV</button>
+      </div>
+      <div id=csv_meta class=csv-meta></div>
+      <div id=csv_cats class=csv-cats></div>
+      <div class=csv-opts>
+        <label class=fresh><input type=checkbox id=csv_use_path checked> PATH ke hisaab se Drive subfolders banao</label>
+        <label class=fresh><input type=checkbox id=csv_use_title checked> NEW TITLE se file rename karo</label>
+      </div>
+      <div id=csv_prev class=csv-prev></div>
+    </div>
+  </div>
+
   <div class=ctl>
     <div class=btns><label class=fresh><input type=checkbox id=in_fr> Fresh (cache / progress clear)</label></div>
     <div class=btns><button id=b_go onclick=go()><svg class="ico" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></svg> Start / Resume</button><button id=b_st class=stop onclick=askStop()><svg class="ico" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/></svg> Stop</button></div>
@@ -1489,7 +1915,17 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
 </div>
 
 <div id=pane-accounts class=tabpane>
-<div class=card><h3><span>Accounts</span><span id=acn></span></h3><div class=accs id=ac></div></div>
+<div class=card>
+  <h3>
+    <span>Accounts</span>
+    <span class=ac-head-r>
+      <span id=acn></span>
+      <button type=button class="sec xs" onclick="pauseAllAccs(true)"><svg class="ico ico-sm" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" fill="currentColor" stroke="none"/></svg> Pause All</button>
+      <button type=button class="sec xs" onclick="pauseAllAccs(false)"><svg class="ico ico-sm" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></svg> Resume All</button>
+    </span>
+  </h3>
+  <div class=accs id=ac></div>
+</div>
 </div>
 
 <div id=pane-logs class=tabpane>
@@ -1515,10 +1951,10 @@ const $=i=>document.getElementById(i);
 const PAL=['#4f9cff','#2ecc71','#f5a623','#c06cff','#ff6b8a','#2ad1d1'];
 const fb=n=>{n=+n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<4){n/=1024;i++}return n.toFixed(i?1:0)+' '+u[i]};
 const ft=s=>{s=Math.round(s);if(!isFinite(s)||s<=0)return '—';const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?h+'h '+m+'m':m?m+'m '+x+'s':x+'s'};
-const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const SVG_PLAY='<svg class="ico" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></svg>',SVG_CHK='<svg class="ico" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>',SVG_FLD='<svg class="ico" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',SVG_X='<svg class="ico ico-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const SVG_PLAY='<svg class="ico" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></svg>',SVG_PAUSE='<svg class="ico" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" fill="currentColor" stroke="none"/></svg>',SVG_CHK='<svg class="ico" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>',SVG_FLD='<svg class="ico" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',SVG_X='<svg class="ico ico-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 let filled=false,lastMap='',lastLog=[],failStreak=0;
-let curMode='channel',queue=[],folderName='';
+let curMode='channel',queue=[],folderName='',csvInfo=null,csvCats=new Set(),lastAccs=[];
 
 // -- tabs --
 function showTab(name){document.querySelectorAll('.tabpane').forEach(p=>p.classList.toggle('on',p.id==='pane-'+name));
@@ -1531,12 +1967,14 @@ setTimeout(()=>{d.style.transition='opacity .4s';d.style.opacity=0;setTimeout(()
 
 // -- mode switcher --
 function setMode(m){
- curMode=m==='list'?'list':'channel';
+ curMode=(m==='list'||m==='csv')?m:'channel';
  $('m_ch').classList.toggle('on',curMode==='channel');
  $('m_ls').classList.toggle('on',curMode==='list');
+ $('m_csv').classList.toggle('on',curMode==='csv');
  $('box_ch').classList.toggle('hide',curMode!=='channel');
  $('box_ls').classList.toggle('hide',curMode!=='list');
- $('b_go').innerHTML=SVG_PLAY+(curMode==='list'?' Upload List':' Start / Resume');
+ $('box_csv').classList.toggle('hide',curMode!=='csv');
+ $('b_go').innerHTML=SVG_PLAY+(curMode==='csv'?' Upload CSV':curMode==='list'?' Upload List':' Start / Resume');
  persist();
 }
 
@@ -1553,6 +1991,77 @@ function renderFolderBadge(){
  const v=$('in_fo').value.trim();
  if(folderName){$('fo_bname').textContent=folderName+(v?' ('+v.slice(0,10)+'…)':'');$('fo_badge').classList.remove('hide')}
  else{$('fo_badge').classList.add('hide')}
+}
+
+// -- CSV upload & preview --
+const csvDrop=$('csv_drop');
+['dragenter','dragover'].forEach(ev=>csvDrop.addEventListener(ev,e=>{e.preventDefault();csvDrop.classList.add('drag')}));
+['dragleave','drop'].forEach(ev=>csvDrop.addEventListener(ev,e=>{e.preventDefault();csvDrop.classList.remove('drag')}));
+csvDrop.addEventListener('drop',e=>{const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(f)onCsvPick(f)});
+
+async function onCsvPick(file){
+ if(!file)return;
+ $('csv_drop_lbl').textContent='Parsing '+file.name+'…';
+ try{
+  const text=await file.text();
+  const r=await fetch('/api/csv/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,text})});
+  const j=await r.json();
+  if(!j.ok){toast(j.error||'CSV parse fail','err');$('csv_drop_lbl').textContent='CSV file choose karo ya yahan drag & drop karo';return}
+  csvInfo=j.csv;
+  csvCats=new Set();
+  renderCsv();
+  toast('CSV load hui: '+csvInfo.total+' files ('+csvInfo.folders_count+' folders)','ok');
+ }catch(e){toast('CSV upload fail ho gaya','err')}
+ $('in_csv').value='';
+ $('csv_drop_lbl').textContent='CSV file choose karo ya yahan drag & drop karo';
+}
+async function clearCsv(){
+ try{await fetch('/api/csv/clear',{method:'POST'})}catch(e){}
+ csvInfo=null;csvCats=new Set();renderCsv();toast('CSV clear ho gayi','warn');
+}
+function toggleCsvCat(cat){
+ if(!cat){csvCats=new Set()}
+ else if(csvCats.has(cat))csvCats.delete(cat);
+ else csvCats.add(cat);
+ renderCsv();
+}
+function renderCsv(){
+ if(!csvInfo||!csvInfo.total){$('csv_body').classList.add('hide');return}
+ $('csv_body').classList.remove('hide');
+ $('csv_fname').textContent=csvInfo.filename||'CSV';
+ $('csv_meta').innerHTML=
+  '<span class=csv-pill><b>'+csvInfo.total+'</b> files</span>'+
+  (csvInfo.total_bytes?'<span class=csv-pill><b>'+fb(csvInfo.total_bytes)+'</b></span>':'')+
+  '<span class=csv-pill><b>'+csvInfo.folders_count+'</b> folders</span>'+
+  '<span class=csv-pill><b>'+(csvInfo.channels?csvInfo.channels.length:1)+'</b> channel</span>'+
+  (csvInfo.skipped?'<span class=csv-pill>'+csvInfo.skipped+' skipped</span>':'');
+ const cats=csvInfo.categories||{};
+ const ckeys=Object.keys(cats);
+ if(ckeys.length>1){
+  $('csv_cats').innerHTML='<button type=button class="csv-cat'+(csvCats.size===0?' on':'')+'" onclick="toggleCsvCat(\'\')">All ('+csvInfo.total+')</button>'+
+   ckeys.map(k=>'<button type=button class="csv-cat'+(csvCats.has(k)?' on':'')+'" onclick="toggleCsvCat(\''+esc(k)+'\')">'+esc(k)+' ('+cats[k]+')</button>').join('');
+ }else{$('csv_cats').innerHTML=''}
+ const prev=(csvInfo.preview||[]).filter(it=>csvCats.size===0||csvCats.has(it.cat));
+ $('csv_prev').innerHTML=prev.length?prev.map(it=>'<div class=csv-row><div class=ct title="'+esc(it.name)+'">'+(it.index_id?'#'+esc(it.index_id)+' · ':'')+esc(it.name||('msg #'+it.msg_id))+'</div><div class=cp>'+(it.folder?esc(it.folder)+' · ':'')+(it.size_hint?fb(it.size_hint):'')+(it.cat?' · '+esc(it.cat):'')+'</div></div>').join(''):'<div class=qempty>Is filter me koi file nahi hai</div>';
+}
+
+// -- Account Pause / Resume --
+async function toggleAccIdx(i){
+ const a=lastAccs[i];if(!a||a.status==='dead')return;
+ try{
+  const r=await fetch('/api/account/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:a.id,paused:!a.paused})});
+  const j=await r.json();
+  if(j.ok){toast(a.name+': '+(j.paused?'Paused':'Resumed'),j.paused?'warn':'ok');tick()}
+  else toast(j.error||'Action fail','err');
+ }catch(e){toast('Request fail ho gaya','err')}
+}
+async function pauseAllAccs(paused){
+ try{
+  const r=await fetch('/api/account/pause',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'__all__',paused})});
+  const j=await r.json();
+  if(j.ok){toast(paused?'Sab accounts pause ho gaye':'Sab accounts resume ho gaye',paused?'warn':'ok');tick()}
+  else toast(j.error||'Action fail','err');
+ }catch(e){toast('Request fail ho gaya','err')}
 }
 
 // -- Telegram link parser & File List / Queue --
@@ -1697,7 +2206,10 @@ function persist(){
 async function go(){
  const folder=$('in_fo').value.trim();
  const payload={mode:curMode,folder,folder_name:folderName,fresh:$('in_fr').checked};
- if(curMode==='list'){
+ if(curMode==='csv'){
+  if(!csvInfo||!csvInfo.total){toast('Pehle CSV file upload karo','err');return}
+  payload.csv_opts={use_path:$('csv_use_path').checked,use_title:$('csv_use_title').checked,cats:Array.from(csvCats)};
+ }else if(curMode==='list'){
   if(!queue.length){toast('File list khaali hai — links ya range add karo','err');return}
   payload.queue=queue;
  }else{
@@ -1731,37 +2243,53 @@ function drawMap(map,n){if(!n){$('map').height=0;lastMap='';return}if(map===last
 const cell=Math.max(3,Math.min(16,Math.floor(Math.sqrt(W*70/n)))),cols=Math.floor(W/(cell+1)),rows=Math.ceil(n/cols);c.width=W;c.height=rows*(cell+1);const x=c.getContext('2d');
 for(let i=0;i<n;i++){const o=parseInt(map.substr(i*2,2),16)||0;x.fillStyle=o==0?'#1a2438':o==255?'#5b6b86':PAL[(o-1)%PAL.length];x.fillRect((i%cols)*(cell+1),Math.floor(i/cols)*(cell+1),cell,cell)}}
 async function tick(){let s;try{const r=await fetch('/api/status');if(r.status==401){location='/login';return}s=await r.json();failStreak=0;$('offlinebar').classList.remove('show')}catch(e){failStreak++;if(failStreak>=2)$('offlinebar').classList.add('show');return}
-if(!filled&&(s.channel||s.folder||(s.queue&&s.queue.length))&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
+if(!filled&&(s.channel||s.folder||(s.queue&&s.queue.length)||s.csv_info)&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
  if(s.channel)$('in_ch').value=s.channel;
  if(s.folder)$('in_fo').value=s.folder;
  if(s.folder_name){folderName=s.folder_name;renderFolderBadge()}
  if(s.queue&&s.queue.length&&!queue.length){queue=s.queue;renderQueue()}
- if(s.mode==='list')setMode('list');
+ if(s.csv_info&&!csvInfo){
+  csvInfo=s.csv_info;
+  if(s.csv_opts){
+   $('csv_use_path').checked=s.csv_opts.use_path!==false;
+   $('csv_use_title').checked=s.csv_opts.use_title!==false;
+   csvCats=new Set(s.csv_opts.cats||[]);
+  }
+  renderCsv();
+ }
+ if(s.mode==='list'||s.mode==='csv')setMode(s.mode);
  filled=true;
 }
-const run=s.status=='running';$('st').textContent=s.stopping?'stopping…':s.status;$('st').className='pill '+(s.stopping?'stopped':s.status);$('b_go').disabled=run;$('b_st').disabled=!run||s.stopping;
+const run=s.status=='running';$('st').textContent=s.stopping?'stopping…':s.all_paused&&run?'paused':s.status;$('st').className='pill '+(s.stopping||(s.all_paused&&run)?'stopped':s.status);$('b_go').disabled=run;$('b_st').disabled=!run||s.stopping;
 const scanning=s.phase=='scanning';$('ph').textContent=scanning?('scanning… '+s.scan.files+' files'):(s.phase||'');
 $('ch').textContent=s.channel_title||'';$('sv').textContent=s.state_ago<0?'state: not saved yet':'state saved '+Math.round(s.state_ago)+'s ago (Saved Messages)';
 const p=s.plan,dl=s.dl,ul=s.ul;
 $('s1').textContent=p.up_files+' / '+p.files;$('s1b').textContent=fb(p.up_bytes)+' uploaded';
 $('s2').textContent=s.rem_files;$('s2b').textContent=fb(Math.max(0,p.bytes-p.up_bytes))+' left';
-$('s3').textContent=fb(s.speed)+'/s';$('s3b').textContent='avg '+fb(s.avg)+'/s · '+s.accs.filter(a=>a.status=='ok'&&a.speed>0).length+' acc active';
+$('s3').textContent=fb(s.speed)+'/s';$('s3b').textContent='avg '+fb(s.avg)+'/s · '+s.accs.filter(a=>a.status=='ok'&&!a.paused&&a.speed>0).length+' acc active';
 $('s4').textContent=fb(ul?ul.speed:0)+'/s';$('s4b').textContent=ul?'uploading now':'idle';$('s5').textContent=ft(s.eta);$('s5b').textContent='download';
 $('s6').textContent=s.elapsed?ft(s.elapsed):'—';$('s6b').textContent='lifetime: '+s.done_count+' files · '+fb(s.total_bytes);
 const pc=p.bytes?Math.min(100,(p.up_bytes+(ul?ul.done:0))/p.bytes*100):0;$('ob').style.width=pc+'%';$('opct').textContent=pc.toFixed(1)+'%';
-$('o1').textContent=fb(p.up_bytes)+' / '+fb(p.bytes);$('o2').textContent='downloaded '+p.dl_files+' files'+(s.mode==='list'?' · list mode':' · last done msg #'+s.last_done);
-if(dl){const q=dl.size?dl.done/dl.size*100:0;$('dn').textContent='#'+dl.id+'  '+dl.name;$('dn').title=dl.name;$('db').style.width=q+'%';$('dt').textContent=fb(dl.done)+' / '+fb(dl.size)+'  @ '+fb(dl.speed)+'/s';
+$('o1').textContent=fb(p.up_bytes)+' / '+fb(p.bytes);$('o2').textContent='downloaded '+p.dl_files+' files'+(s.mode==='csv'?' · csv mode':s.mode==='list'?' · list mode':' · last done msg #'+s.last_done);
+if(dl){const q=dl.size?dl.done/dl.size*100:0;$('dn').textContent='#'+dl.id+'  '+dl.name;$('dn').title=(dl.folder?dl.folder+'/':'')+dl.name;$('db').style.width=q+'%';$('dt').textContent=fb(dl.done)+' / '+fb(dl.size)+'  @ '+fb(dl.speed)+'/s';
 $('dp').textContent=q.toFixed(1)+'%  ·  '+ft(dl.speed>0?(dl.size-dl.done)/dl.speed:0);$('dseg').textContent=dl.nseg?dl.segs_done+' / '+dl.nseg+' segments':'';drawMap(dl.map||'',dl.nseg)}
 else{$('dn').textContent=scanning?'scanning…':'—';$('db').style.width=0;$('dt').textContent=$('dp').textContent=$('dseg').textContent='';drawMap('',0)}
-if(ul){const q=ul.size?ul.done/ul.size*100:0;$('un').textContent='#'+ul.id+'  '+ul.name;$('un').title=ul.name;$('uspd').textContent=fb(ul.speed)+'/s';$('ub').style.width=q+'%';$('ut').textContent=fb(ul.done)+' / '+fb(ul.size)+'  @ '+fb(ul.speed)+'/s';$('up').textContent=q.toFixed(1)+'%  ·  '+ft(ul.speed>0?(ul.size-ul.done)/ul.speed:0)}
+if(ul){const q=ul.size?ul.done/ul.size*100:0;$('un').textContent='#'+ul.id+'  '+ul.name;$('un').title=(ul.folder?ul.folder+'/':'')+ul.name;$('uspd').textContent=fb(ul.speed)+'/s';$('ub').style.width=q+'%';$('ut').textContent=fb(ul.done)+' / '+fb(ul.size)+'  @ '+fb(ul.speed)+'/s';$('up').textContent=q.toFixed(1)+'%  ·  '+ft(ul.speed>0?(ul.size-ul.done)/ul.speed:0)}
 else{$('un').textContent='—';$('uspd').textContent='';$('ub').style.width=0;$('ut').textContent=$('up').textContent=''}
-$('nx').innerHTML=s.next.length?s.next.map(n=>'<span>#'+n.id+' · '+fb(n.size)+'</span>').join(''):'<span>—</span>';
-const mxs=Math.max(2097152,...s.accs.map(a=>a.speed));$('acn').textContent=s.accs.length+' accounts'+(s.cryptg?' · cryptg: OK':' · cryptg: off');
-$('ac').innerHTML=s.accs.map(a=>{const col=PAL[a.idx%PAL.length];let ch=a.status=='flood'?'<span class="chip flood">flood '+a.flood_left+'s</span>':a.status=='dead'?'<span class="chip dead">dead</span>':a.speed>0?'<span class=chip>active</span>':'<span class="chip idle">idle</span>';
-return '<div class=ac><div class=h><span class=dot style="background:'+col+'"></span><div style="min-width:0"><div class=n>'+esc(a.name)+'</div><div class=ph>'+esc(a.phone)+'</div></div>'+ch+'</div>'
+$('nx').innerHTML=s.next.length?s.next.map(n=>'<span>#'+n.id+(n.name?' · '+esc(n.name.slice(0,36)):'')+' · '+fb(n.size)+'</span>').join(''):'<span>—</span>';
+lastAccs=s.accs||[];
+const pCnt=lastAccs.filter(a=>a.paused&&a.status!=='dead').length;
+const mxs=Math.max(2097152,...lastAccs.map(a=>a.speed));
+$('acn').textContent=lastAccs.length+' accounts'+(pCnt?' · '+pCnt+' paused':'')+(s.cryptg?' · cryptg: OK':' · cryptg: off');
+$('ac').innerHTML=lastAccs.map((a,i)=>{const col=PAL[a.idx%PAL.length];
+const dead=a.status=='dead';
+let ch=dead?'<span class="chip dead">dead</span>':a.paused?'<span class="chip paused">paused</span>':a.status=='flood'?'<span class="chip flood">flood '+a.flood_left+'s</span>':a.speed>0?'<span class=chip>active</span>':'<span class="chip idle">idle</span>';
+const btn=dead?'<button type=button class="sec" disabled>Dead</button>':a.paused?'<button type=button class="okbtn" onclick="toggleAccIdx('+i+')">'+SVG_PLAY+' Resume</button>':'<button type=button class="wabtn" onclick="toggleAccIdx('+i+')">'+SVG_PAUSE+' Pause</button>';
+return '<div class="ac'+(a.paused&&!dead?' paused':'')+'"><div class=h><span class=dot style="background:'+col+'"></span><div style="min-width:0"><div class=n>'+esc(a.name)+'</div><div class=ph>'+esc(a.phone)+'</div></div>'+ch+'</div>'
 +'<div class=sp>'+fb(a.speed)+'/s</div><div class=bar><i style="width:'+Math.min(100,a.speed/mxs*100)+'%;background:'+col+'"></i></div>'
 +'<div class=row><span>'+fb(a.bytes)+' · '+a.segs+' seg</span><span>'+a.conn+' conn</span></div>'
-+'<div class=row><span>flood: '+a.floods+'</span><span>errors: '+a.errors+'</span></div>'+(a.last_err?'<div class=er title="'+esc(a.last_err)+'">'+esc(a.last_err)+'</div>':'')+'</div>'}).join('');
++'<div class=row><span>flood: '+a.floods+'</span><span>errors: '+a.errors+'</span></div>'+(a.last_err?'<div class=er title="'+esc(a.last_err)+'">'+esc(a.last_err)+'</div>':'')
++'<div class=act>'+btn+'</div></div>'}).join('');
 drawChart(s.hist);
 lastLog=s.log;renderLog();
 $('opct2').textContent=$('opct').textContent;$('ob2').style.width=$('ob').style.width;$('o1b').textContent=$('o1').textContent;$('o2b').textContent=$('o2').textContent;
@@ -1809,6 +2337,64 @@ async def h_status(req):
     if not authed(req):
         return web.Response(status=401)
     return web.json_response(status_json())
+
+
+async def h_csv_parse(req):
+    if not authed(req):
+        return web.Response(status=401)
+    try:
+        ct = (req.headers.get("Content-Type") or "").lower()
+        if "multipart/form-data" in ct:
+            reader = await req.multipart()
+            field = await reader.next()
+            if field is None:
+                return web.json_response({"ok": False, "error": "CSV file nahi mili"})
+            fname = field.filename or "upload.csv"
+            raw = await field.read(decode=False)
+            text = raw.decode("utf-8-sig", errors="replace")
+        else:
+            d = await req.json()
+            fname = (d.get("filename") or "upload.csv").strip()
+            text = d.get("text") or ""
+        parsed = parse_csv_text(text, filename=fname)
+        S["csv_staged"] = parsed
+        save_csv_staged()
+        log(f"CSV parsed: {parsed['filename']} ({len(parsed['items'])} files, {parsed['folders_count']} folders)", "ok")
+        return web.json_response({"ok": True, "csv": csv_summary_view(parsed)})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)[:200]})
+
+
+async def h_csv_clear(req):
+    if not authed(req):
+        return web.Response(status=401)
+    S["csv_staged"] = {"filename": "", "items": [], "skipped": 0, "categories": {}, "folders_count": 0, "channels": [], "total_bytes": 0}
+    try:
+        if os.path.exists(CSV_STAGED_FILE):
+            os.remove(CSV_STAGED_FILE)
+    except OSError:
+        pass
+    return web.json_response({"ok": True})
+
+
+async def h_account_pause(req):
+    if not authed(req):
+        return web.Response(status=401)
+    d = await req.json()
+    aid = d.get("id")
+    paused = d.get("paused")
+    if aid == "__all__":
+        target = bool(paused)
+        for k, a in S["accs"].items():
+            if a["status"] != "dead":
+                set_account_paused(k, target)
+        return web.json_response({"ok": True, "id": "__all__", "paused": target})
+    if aid not in S["accs"]:
+        return web.json_response({"ok": False, "error": "Account nahi mila"})
+    if paused is None:
+        paused = not S["accs"][aid]["paused"]
+    ok, err = set_account_paused(aid, bool(paused))
+    return web.json_response({"ok": ok, "id": aid, "paused": S["accs"][aid]["paused"], "error": err})
 
 
 async def h_drive_list(req):
@@ -1859,6 +2445,8 @@ def reset_progress():
     S["scan"] = {"files": 0, "bytes": 0}
     cur_state["cur"] = None
     save_state.last = None
+    with FOLDER_LOCK:
+        FOLDER_CACHE.clear()
     try:
         for fn in os.listdir(DATA_DIR):
             if fn.endswith(".part"):
@@ -1867,12 +2455,33 @@ def reset_progress():
         pass
 
 
-async def start_job(mode="channel", channel="", folder="", folder_name="", start_id=0, queue=None, fresh=False):
+async def start_job(mode="channel", channel="", folder="", folder_name="", start_id=0, queue=None, csv_opts=None, fresh=False):
     global JOB
     if JOB and not JOB.done():
         return False, "Pehle se chal raha hai"
-    mode = "list" if mode == "list" else "channel"
-    if mode == "list":
+    mode = mode if mode in ("channel", "list", "csv") else "channel"
+    if mode == "csv":
+        opts = csv_opts if isinstance(csv_opts, dict) else S["csv_opts"]
+        use_path = bool(opts.get("use_path", True))
+        use_title = bool(opts.get("use_title", True))
+        cats = [str(c) for c in (opts.get("cats") or []) if str(c).strip()]
+        cat_set = set(cats)
+        src_items = queue if queue else (S["csv_staged"].get("items") or [])
+        if cat_set:
+            src_items = [it for it in src_items if it.get("cat") in cat_set]
+        q = normalize_queue(src_items)
+        if not q:
+            return False, "CSV me koi matching file nahi mili — pehle CSV upload karo"
+        if fresh or S["mode"] != "csv":
+            if fresh:
+                log("fresh start: purana CSV progress clear kiya", "warn")
+                with FOLDER_LOCK:
+                    FOLDER_CACHE.clear()
+            S["done_keys"] = []
+            cur_state["cur"] = None
+        S["csv_opts"] = {"use_path": use_path, "use_title": use_title, "cats": cats}
+        S.update(mode="csv", queue=q, folder=folder, folder_name=folder_name)
+    elif mode == "list":
         q = normalize_queue(queue)
         if not q:
             return False, "File list khaali hai ya valid link/range nahi mila"
@@ -1889,6 +2498,7 @@ async def start_job(mode="channel", channel="", folder="", folder_name="", start
             log("fresh start: purana progress (last_done / cache) clear kiya", "warn")
             reset_progress()
         S.update(mode="channel", channel=channel, folder=folder, folder_name=folder_name, start_id=start_id)
+    save_local_job_store()
     JOB = asyncio.create_task(run_job())
     return True, ""
 
@@ -1907,6 +2517,7 @@ async def h_start(req):
         folder_name=folder_name,
         start_id=int(d.get("start_id") or 0),
         queue=d.get("queue"),
+        csv_opts=d.get("csv_opts"),
         fresh=bool(d.get("fresh")),
     )
     return web.json_response({"ok": ok, "error": err})
@@ -1940,7 +2551,8 @@ async def startup_checks():
         a = S["accs"][aid]
         try:
             me = await asyncio.wait_for(cl.get_me(), 20)
-            log(f"telegram OK: {a['name']} (@{me.username or me.id})", "ok")
+            p_tag = " [PAUSED]" if a.get("paused") else ""
+            log(f"telegram OK: {a['name']} (@{me.username or me.id}){p_tag}", "ok")
         except Exception as e:
             if is_dead(e):
                 acc_dead(a, e)
@@ -1960,6 +2572,8 @@ async def on_start(app):
     global PRIMARY, PRIMARY_AID
     cfg = load_json("ACCOUNTS_JSON", "accounts.json")
     ticked = set(cfg.get("par", {}).get("ticked", [a["id"] for a in cfg["list"]]))
+    saved_paused = load_paused_accs()
+    load_csv_staged()
     for a in cfg["list"]:
         if a["id"] not in ticked:
             continue
@@ -1976,7 +2590,8 @@ async def on_start(app):
         CLIENTS[a["id"]] = cl
         S["accs"][a["id"]] = {"idx": len(S["accs"]), "name": a["name"], "phone": a["phone"], "bytes": 0,
                               "speed": 0, "segs": 0, "conn": CONN,
-                              "status": "ok", "flood_until": 0, "floods": 0, "errors": 0, "last_err": ""}
+                              "status": "ok", "paused": (a["id"] in saved_paused),
+                              "flood_until": 0, "floods": 0, "errors": 0, "last_err": ""}
         if a["id"] == cfg.get("active") or PRIMARY is None:
             PRIMARY, PRIMARY_AID = cl, a["id"]
     if not CLIENTS:
@@ -1991,22 +2606,34 @@ async def on_start(app):
     except Exception as e:
         log(f"state load fail/timeout: {e}", "warn")
         st = None
-    if st:
+    local_st = _read_json_safe(JOB_STORE_FILE) or {}
+    if st or local_st:
+        src = st or local_st
+        mode = src.get("mode", "channel")
+        # Local job_store me full queue & done_keys hoti hain (Telegram 4096 char limit se bachne ke liye)
+        q_saved = local_st.get("queue") if (local_st.get("mode") == mode and local_st.get("queue")) else src.get("queue", [])
+        dk_saved = list(dict.fromkeys((local_st.get("done_keys") or []) + (src.get("done_keys") or [])))
         S.update(
-            mode=st.get("mode", "channel"),
-            channel=st.get("channel", ""),
-            folder=st.get("folder", ""),
-            folder_name=st.get("folder_name", ""),
-            queue=st.get("queue", []),
-            done_keys=st.get("done_keys", []),
-            last_done=st.get("last_done", 0),
-            done_count=st.get("done_count", 0),
-            total_bytes=st.get("total_bytes", 0),
+            mode=mode,
+            channel=src.get("channel", local_st.get("channel", "")),
+            folder=src.get("folder", local_st.get("folder", "")),
+            folder_name=src.get("folder_name", local_st.get("folder_name", "")),
+            queue=q_saved,
+            done_keys=dk_saved,
+            last_done=max(src.get("last_done", 0), local_st.get("last_done", 0)),
+            done_count=max(src.get("done_count", 0), local_st.get("done_count", 0)),
+            total_bytes=max(src.get("total_bytes", 0), local_st.get("total_bytes", 0)),
         )
-        cur_state["cur"] = st.get("cur")
+        if isinstance(src.get("csv_opts") or local_st.get("csv_opts"), dict):
+            S["csv_opts"] = src.get("csv_opts") or local_st.get("csv_opts")
+        cur_state["cur"] = src.get("cur") or local_st.get("cur")
         log(f"saved state mila: mode={S['mode']}, last_done={S['last_done']}, done={S['done_count']}", "ok")
-        if st.get("running"):
-            if S["mode"] == "list" and S["queue"]:
+        if st and st.get("running"):
+            if S["mode"] == "csv" and (S["queue"] or S["csv_staged"].get("items")):
+                log("crash se pehle CSV mode running tha -> auto resume", "warn")
+                await start_job(mode="csv", folder=S["folder"], folder_name=S["folder_name"],
+                                queue=S["queue"] or None, csv_opts=S["csv_opts"])
+            elif S["mode"] == "list" and S["queue"]:
                 log("crash se pehle list mode running tha -> auto resume", "warn")
                 await start_job(mode="list", folder=S["folder"], folder_name=S["folder_name"], queue=S["queue"])
             elif S["mode"] == "channel" and S["channel"]:
@@ -2018,13 +2645,16 @@ async def on_start(app):
 
 
 def main():
-    app = web.Application()
+    app = web.Application(client_max_size=50 * 1024 * 1024)
     app.add_routes([
         web.get("/", h_index),
         web.route("*", "/login", h_login),
         web.get("/api/status", h_status),
         web.post("/api/start", h_start),
         web.post("/api/stop", h_stop),
+        web.post("/api/csv/parse", h_csv_parse),
+        web.post("/api/csv/clear", h_csv_clear),
+        web.post("/api/account/pause", h_account_pause),
         web.get("/api/drive/folders", h_drive_list),
         web.post("/api/drive/folders", h_drive_create),
         web.get("/api/drive/folder_info", h_drive_info),
