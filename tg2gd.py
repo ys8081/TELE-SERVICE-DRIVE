@@ -4,8 +4,9 @@ Telegram -> (Render/PC disk) -> Google Drive   |  multi-account, resumable, live
 Features:
 - Full Channel mode (start msg ID se auto-scan + resumable)
 - File List / Queue mode (per-file Telegram links ya specific channel ki Msg ID range se list banakar upload)
-- CSV Import mode (id_link, NEW TITLE, PATH, TYPE, size_bytes wali CSV se auto subfolder tree + rename upload)
+- CSV Import mode (id_link, NEW TITLE, PATH, TYPE, size_bytes, INDEX ID wali CSV se auto subfolder tree, rename, aur Continue from Specific INDEX ID)
 - Per-Account Pause / Resume (kisi bhi account ko live pause/resume karo bina baaki accounts roke)
+- Google Drive Root State (tg2gd_state.txt — Render restart safe, no 4KB limit, built-in online State Editor in UI)
 - Google Drive Folder Picker & Creator Pop-up (link paste karna zaruri nahi, seedha Drive se select ya create karo)
 
 Chalane ke liye (Windows / Linux / Render):
@@ -14,7 +15,7 @@ Missing packages khud install ho jaate hain. Same folder me accounts.json + toke
 (ya env: ACCOUNTS_JSON / TOKEN_JSON, Render Secret Files: /etc/secrets/).
 
 Env (sab optional):
-    PORT=8080  DATA_DIR=./data  APP_PASSWORD=808177  STATE_INTERVAL=3
+    PORT=8080  DATA_DIR=./data  APP_PASSWORD=808177  STATE_INTERVAL=10  STATE_FILE_NAME=tg2gd_state.txt
     CONN=1 (har account ke max parallel connections)  MAX_MBPS=2 (har account ki max download speed, MB/s; 0 = unlimited)
 """
 import os, sys, re, io, csv, json, time, asyncio, secrets, logging, collections, shutil, subprocess, importlib, threading
@@ -88,13 +89,14 @@ from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+from googleapiclient.http import MediaInMemoryUpload
 
 logging.basicConfig(level=logging.ERROR)
 PORT = int(os.environ.get("PORT", 8080))
 PASSWORD = os.environ.get("APP_PASSWORD", "808177")
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
-STATE_INTERVAL = float(os.environ.get("STATE_INTERVAL", 3))
+STATE_INTERVAL = float(os.environ.get("STATE_INTERVAL", 10))
+STATE_FILE_NAME = os.environ.get("STATE_FILE_NAME", "tg2gd_state.txt")
 CONN = int(os.environ.get("CONN", 1))                    # har account ke liye max parallel connections (default 1)
 MAX_MBPS = float(os.environ.get("MAX_MBPS", 2))          # har account ki max download speed (MB/s), 0 = unlimited
 MAX_BPS = int(MAX_MBPS * 1024 * 1024)
@@ -102,7 +104,6 @@ _NEXT = {}                                               # per-account throttle 
 PRIMARY_SMALL = os.environ.get("PRIMARY_SMALL", "0") == "1"   # 1 = chhoti files sirf primary se (default band)
 SEG = 8 * 1024 * 1024            # 1 segment = 8 MB (accounts me baante jaate hain)
 REQ = 1024 * 1024                # telegram request size
-STATE_TAG = "TG2GD_STATE"
 DEAD = {"AuthKeyUnregisteredError", "SessionRevokedError", "UserDeactivatedError",
         "UserDeactivatedBanError", "AuthKeyDuplicatedError", "SessionExpiredError"}
 try:
@@ -115,10 +116,6 @@ except OSError:
     print(f"[setup] DATA_DIR '{DATA_DIR}' use nahi ho sakta (disk nahi / permission) -> temp folder use hoga", flush=True)
     DATA_DIR = os.path.join(tempfile.gettempdir(), "tg2gd")
     os.makedirs(DATA_DIR, exist_ok=True)
-
-JOB_STORE_FILE = os.path.join(DATA_DIR, "job_store.json")
-PAUSED_ACCS_FILE = os.path.join(DATA_DIR, "paused_accs.json")
-CSV_STAGED_FILE = os.path.join(DATA_DIR, "csv_staged.json")
 
 FOLDER_CACHE = {}
 FOLDER_LOCK = threading.Lock()
@@ -140,17 +137,21 @@ def load_json(env, fname):
     raise SystemExit(f"{env} ya {fname} nahi mila")
 
 
+def empty_csv_staged():
+    return {"filename": "", "items": [], "skipped": 0, "categories": {}, "folders_count": 0, "channels": [], "total_bytes": 0}
+
+
 # ------------------------------------------------------------------ global state
 S = {
     "status": "idle", "phase": "", "mode": "channel",
     "channel": "", "channel_title": "", "folder": "", "folder_name": "", "start_id": 0,
     "queue": [], "done_keys": [],
-    "csv_staged": {"filename": "", "items": [], "skipped": 0, "categories": {}, "folders_count": 0, "channels": [], "total_bytes": 0},
-    "csv_opts": {"use_path": True, "use_title": True, "cats": []},
-    "last_done": 0, "done_count": 0, "total_bytes": 0,          # lifetime (saved messages me persist)
+    "csv_staged": empty_csv_staged(),
+    "csv_opts": {"use_path": True, "use_title": True, "cats": [], "start_index_id": ""},
+    "last_done": 0, "last_index_id": "", "done_count": 0, "total_bytes": 0,
     "scan": {"files": 0, "bytes": 0},
     "plan": {"files": 0, "bytes": 0, "dl_files": 0, "dl_bytes": 0, "up_files": 0, "up_bytes": 0},
-    "started_at": 0, "ended_at": 0, "speed": 0, "state_ts": 0,
+    "started_at": 0, "ended_at": 0, "speed": 0, "state_ts": 0, "state_file_id": "",
     "dl": None, "ul": None, "next": [],
     "accs": {}, "log": collections.deque(maxlen=300), "hist": collections.deque(maxlen=120),
     "stop": False, "failed": False,
@@ -158,8 +159,8 @@ S = {
 CLIENTS = {}
 PRIMARY = None
 PRIMARY_AID = None
-STATE_MSG_ID = None
-STATE_BLOCK = [0.0]
+STATE_FILE_ID = None
+STATE_LOCK = None
 cur_state = {"cur": None}
 CUR_OWNER = [bytearray()]
 CUR_TASKS = []
@@ -184,63 +185,6 @@ def is_dead(e):
     return type(e).__name__ in DEAD
 
 
-# ------------------------------------------------------------------ local disk persistence (large CSV + paused accs)
-def _write_json_atomic(path, data):
-    tmp = path + ".tmp"
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, separators=(",", ":"))
-        os.replace(tmp, path)
-    except OSError:
-        pass
-
-
-def _read_json_safe(path):
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def save_local_job_store():
-    _write_json_atomic(JOB_STORE_FILE, {
-        "mode": S["mode"],
-        "channel": S["channel"],
-        "folder": S["folder"],
-        "folder_name": S["folder_name"],
-        "queue": S["queue"],
-        "done_keys": S["done_keys"],
-        "csv_opts": S["csv_opts"],
-        "last_done": S["last_done"],
-        "done_count": S["done_count"],
-        "total_bytes": S["total_bytes"],
-        "cur": cur_state["cur"],
-    })
-
-
-def save_paused_accs():
-    paused = [aid for aid, a in S["accs"].items() if a.get("paused")]
-    _write_json_atomic(PAUSED_ACCS_FILE, paused)
-
-
-def load_paused_accs():
-    data = _read_json_safe(PAUSED_ACCS_FILE)
-    return set(data) if isinstance(data, list) else set()
-
-
-def save_csv_staged():
-    _write_json_atomic(CSV_STAGED_FILE, S["csv_staged"])
-
-
-def load_csv_staged():
-    data = _read_json_safe(CSV_STAGED_FILE)
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        S["csv_staged"] = data
-
-
 async def flood_safe(fn, who="", tries=10):
     """Control-plane calls (messages fetch etc.) FloodWait par ruk kar dobara try karte hain."""
     for _ in range(tries):
@@ -255,80 +199,129 @@ async def flood_safe(fn, who="", tries=10):
     return await fn()
 
 
-# ------------------------------------------------------------------ saved-messages state
+# ------------------------------------------------------------------ Google Drive root state (tg2gd_state.txt)
 def state_dict():
-    cur = cur_state["cur"]
-    d = {
+    paused_accs = [aid for aid, a in S["accs"].items() if a.get("paused")]
+    return {
         "mode": S["mode"],
-        "channel": S["channel"], "folder": S["folder"], "folder_name": S["folder_name"],
-        "last_done": S["last_done"], "done_count": S["done_count"], "total_bytes": S["total_bytes"],
-        "running": S["status"] == "running", "cur": cur,
+        "channel": S["channel"],
+        "folder": S["folder"],
+        "folder_name": S["folder_name"],
+        "start_id": S["start_id"],
+        "last_done": S["last_done"],
+        "last_index_id": S["last_index_id"],
+        "done_count": S["done_count"],
+        "total_bytes": S["total_bytes"],
+        "running": S["status"] == "running",
+        "cur": cur_state["cur"],
+        "paused_accs": paused_accs,
+        "csv_opts": S["csv_opts"],
+        "queue": S["queue"],
+        "done_keys": S["done_keys"],
+        "csv_staged": S["csv_staged"],
     }
-    if S["mode"] == "list":
-        d["queue"] = S["queue"]
-        d["done_keys"] = S["done_keys"]
-    elif S["mode"] == "csv":
-        d["csv_file"] = S["csv_staged"].get("filename", "")
-        d["csv_opts"] = S["csv_opts"]
-        d["done_keys"] = S["done_keys"][-120:]
-    if len(json.dumps(d)) > 3800:           # telegram msg limit
-        d["cur"] = None
-    if len(json.dumps(d)) > 3800 and "done_keys" in d:
-        d["done_keys"] = d["done_keys"][-80:]
-    if len(json.dumps(d)) > 3800 and "queue" in d:
-        d["queue"] = d["queue"][:40]
-    return d
 
 
-async def save_state(force=False, _retry=True):
-    global STATE_MSG_ID
-    save_local_job_store()
-    if not PRIMARY or time.time() < STATE_BLOCK[0]:
+def drive_find_state_file_sync(svc=None):
+    svc = svc or drive_service()
+    safe_n = STATE_FILE_NAME.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name = '{safe_n}' and 'root' in parents and trashed = false"
+    res = svc.files().list(
+        q=q, spaces="drive", fields="files(id,name,modifiedTime)",
+        orderBy="modifiedTime desc", pageSize=1,
+    ).execute()
+    files = res.get("files", [])
+    return files[0]["id"] if files else None
+
+
+def drive_load_state_sync():
+    svc = drive_service()
+    fid = drive_find_state_file_sync(svc)
+    if not fid:
+        return None, None, ""
+    raw = svc.files().get_media(fileId=fid).execute()
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    data = json.loads(text) if text.strip() else {}
+    return fid, data, text
+
+
+def drive_save_state_sync(text, file_id=None):
+    svc = drive_service()
+    media = MediaInMemoryUpload(text.encode("utf-8"), mimetype="text/plain", resumable=False)
+    fid = file_id or drive_find_state_file_sync(svc)
+    if fid:
+        try:
+            r = svc.files().update(fileId=fid, media_body=media, fields="id").execute()
+            return r["id"]
+        except Exception as e:
+            if "404" not in str(e) and "not found" not in str(e).lower():
+                raise
+    meta = {"name": STATE_FILE_NAME, "parents": ["root"], "mimeType": "text/plain"}
+    r = svc.files().create(body=meta, media_body=media, fields="id").execute()
+    return r["id"]
+
+
+def apply_state_dict(d):
+    """Drive state dict ko in-memory state S me load karta hai."""
+    if not isinstance(d, dict):
         return
-    d = state_dict()
-    body = json.dumps(d, separators=(",", ":"))
-    if body == getattr(save_state, "last", None) and not force:
-        S["state_ts"] = time.time()
-        return
-    txt = STATE_TAG + "\n" + json.dumps({**d, "ts": int(time.time())}, separators=(",", ":"))
-    try:
-        if STATE_MSG_ID:
-            await PRIMARY.edit_message("me", STATE_MSG_ID, txt)
-        else:
-            m = await PRIMARY.send_message("me", txt)
-            STATE_MSG_ID = m.id
-        save_state.last = body
-        S["state_ts"] = time.time()
-    except FLOOD as e:
-        STATE_BLOCK[0] = time.time() + e.seconds + 1
-        log(f"state save: FloodWait {e.seconds}s (baad me save hoga)", "warn")
-    except Exception as e:
-        s = (type(e).__name__ + " " + str(e)).lower()
-        if "not modified" in s or "messagenotmodified" in s:
-            save_state.last = body
+    mode = d.get("mode", "channel")
+    if mode not in ("channel", "list", "csv"):
+        mode = "channel"
+    S.update(
+        mode=mode,
+        channel=str(d.get("channel") or ""),
+        folder=str(d.get("folder") or ""),
+        folder_name=str(d.get("folder_name") or ""),
+        start_id=int(d.get("start_id") or 0),
+        last_done=int(d.get("last_done") or 0),
+        last_index_id=str(d.get("last_index_id") or ""),
+        done_count=int(d.get("done_count") or 0),
+        total_bytes=int(d.get("total_bytes") or 0),
+        queue=d.get("queue") if isinstance(d.get("queue"), list) else [],
+        done_keys=[str(x) for x in (d.get("done_keys") or [])],
+    )
+    if isinstance(d.get("csv_opts"), dict):
+        co = d["csv_opts"]
+        S["csv_opts"] = {
+            "use_path": bool(co.get("use_path", True)),
+            "use_title": bool(co.get("use_title", True)),
+            "cats": [str(c) for c in (co.get("cats") or []) if str(c).strip()],
+            "start_index_id": str(co.get("start_index_id") or "").strip(),
+        }
+    if isinstance(d.get("csv_staged"), dict) and isinstance(d["csv_staged"].get("items"), list):
+        S["csv_staged"] = d["csv_staged"]
+    else:
+        S["csv_staged"] = empty_csv_staged()
+    cur_state["cur"] = d.get("cur") if isinstance(d.get("cur"), dict) else None
+    paused_set = set(d.get("paused_accs") or []) if isinstance(d.get("paused_accs"), list) else set()
+    for aid, a in S["accs"].items():
+        if a["status"] != "dead":
+            a["paused"] = (aid in paused_set)
+
+
+async def save_state(force=False):
+    global STATE_FILE_ID, STATE_LOCK
+    if STATE_LOCK is None:
+        STATE_LOCK = asyncio.Lock()
+    async with STATE_LOCK:
+        d = state_dict()
+        cmp_body = json.dumps(d, separators=(",", ":"), ensure_ascii=False)
+        if cmp_body == getattr(save_state, "last", None) and not force:
             S["state_ts"] = time.time()
-        elif ("message_id_invalid" in s or "messageidinvalid" in s or "id is invalid" in s
-              or "not found" in s or "messageauthorrequired" in s or "can't do that operation" in s):
-            # purana state message edit nahi ho sakta -> naya bhej do
-            log("state message invalid tha -> naya state message bana raha hoon", "warn")
-            STATE_MSG_ID = None
-            if _retry:
-                await save_state(True, _retry=False)
-        else:
-            log(f"state save err: {e}", "err")
-
-
-async def load_state():
-    global STATE_MSG_ID
-    async for m in PRIMARY.iter_messages("me", search=STATE_TAG, limit=5):
-        if m.text and m.text.startswith(STATE_TAG):
-            try:
-                d = json.loads(m.text.split("\n", 1)[1])
-            except Exception:
-                continue
-            STATE_MSG_ID = m.id
-            return d
-    return None
+            return True
+        payload = {**d, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        txt = json.dumps(payload, indent=2, ensure_ascii=False)
+        try:
+            fid = await asyncio.to_thread(drive_save_state_sync, txt, STATE_FILE_ID)
+            STATE_FILE_ID = fid
+            S["state_file_id"] = fid or ""
+            save_state.last = cmp_body
+            S["state_ts"] = time.time()
+            return True
+        except Exception as e:
+            log(f"drive state save err: {e}", "err")
+            return False
 
 
 async def state_loop():
@@ -449,12 +442,10 @@ def parse_csv_text(text, filename="upload.csv"):
         raise ValueError("CSV me header row nahi mili")
 
     def find_col(exact_names, contains_names=()):
-        # exact case-sensitive first
         for cand in exact_names:
             for h in headers:
                 if h.strip() == cand:
                     return h
-        # exact case-insensitive
         low_map = {h.strip().lower(): h for h in headers}
         for cand in exact_names:
             if cand.lower() in low_map:
@@ -470,7 +461,7 @@ def parse_csv_text(text, filename="upload.csv"):
     col_old_title = find_col(["OLD TITLE", "old_title"])
     col_path = find_col(["PATH", "path", "folder_path", "dir", "folder"])
     col_size = find_col(["size_bytes", "size", "bytes"])
-    # Note: CSV me 'type' (pdf/video) aur 'TYPE' (LECTURES/NOTES/DPP) dono ho sakte hain
+    # CSV me 'type' (pdf/video) aur 'TYPE' (LECTURES/NOTES/DPP) dono ho sakte hain
     col_cat = find_col(["TYPE", "category", "cat"])
     if col_cat is None:
         col_cat = find_col(["type"])
@@ -565,6 +556,35 @@ def parse_csv_text(text, filename="upload.csv"):
     }
 
 
+def filter_csv_items(items, cats=None, start_index_id=""):
+    """CSV items ko start_index_id aur category filter ke hisaab se slice/filter karta hai."""
+    res = list(items or [])
+    sidx = str(start_index_id or "").strip()
+    if sidx:
+        exact_pos = None
+        for i, it in enumerate(res):
+            if str(it.get("index_id") or "").strip() == sidx:
+                exact_pos = i
+                break
+        if exact_pos is not None:
+            res = res[exact_pos:]
+        elif sidx.isdigit():
+            target = int(sidx)
+            num_pos = None
+            for i, it in enumerate(res):
+                iv = str(it.get("index_id") or "").strip()
+                if iv.isdigit() and int(iv) >= target:
+                    num_pos = i
+                    break
+            res = res[num_pos:] if num_pos is not None else []
+        else:
+            res = []
+    cat_set = set(c for c in (cats or []) if str(c).strip())
+    if cat_set:
+        res = [it for it in res if it.get("cat") in cat_set]
+    return res
+
+
 def csv_summary_view(staged):
     items = staged.get("items") or []
     return {
@@ -582,7 +602,7 @@ def csv_summary_view(staged):
             "folder": "/".join(it.get("folder_parts") or []),
             "size_hint": it.get("size_hint", 0),
             "cat": it.get("cat", ""),
-        } for it in items[:80]],
+        } for it in items[:1500]],
     }
 
 
@@ -629,7 +649,6 @@ async def resolve_channel(client, spec, who="", known_ent_id=None, known_title=N
             r = await client(CheckChatInviteRequest(val))
         except Exception as e:
             if type(e).__name__ in ("InviteHashExpiredError", "InviteHashInvalidError"):
-                # link expire/revoke ho gaya -> agar account already member hai to dialogs se utha lo
                 ent_id = known_ent_id or S.get("_ent_id")
                 ch_title = known_title or S.get("channel_title")
                 async for dlg in client.iter_dialogs():
@@ -723,7 +742,6 @@ def set_account_paused(aid, paused):
             a["speed"] = 0
         log(f"[{a['name']}] {'PAUSED (download/upload se roka gaya)' if new_val else 'RESUMED (wapas active)'}",
             "warn" if new_val else "ok")
-        save_paused_accs()
     return True, ""
 
 
@@ -1208,12 +1226,12 @@ def upload_blocking(path, name, folder, ul):
             raise RuntimeError(f"drive upload {code}: {r.text[:200]}")
 
 
-async def upload_file(msg_id, path, name, size, folder_parts=None):
+async def upload_file(msg_id, path, name, size, folder_parts=None, index_id=""):
     target_folder = S["folder"]
     if folder_parts:
         target_folder = await asyncio.to_thread(ensure_drive_path_sync, S["folder"], folder_parts)
     ul = {"id": msg_id, "name": name, "size": size, "done": 0, "speed": 0,
-          "folder": "/".join(folder_parts) if folder_parts else ""}
+          "folder": "/".join(folder_parts) if folder_parts else "", "index_id": index_id}
     S["ul"] = ul
     try:
         r = await asyncio.to_thread(upload_blocking, path, name, target_folder, ul)
@@ -1221,7 +1239,8 @@ async def upload_file(msg_id, path, name, size, folder_parts=None):
         S["ul"] = None
     if r:
         prefix = f"{'/'.join(folder_parts)}/" if folder_parts else ""
-        log(f"Drive OK: {prefix}{name}", "ok")
+        itag = f" [INDEX #{index_id}]" if index_id else ""
+        log(f"Drive OK: {prefix}{name}{itag}", "ok")
     return bool(r)
 
 
@@ -1247,13 +1266,12 @@ async def scan_channel(ent, min_id):
 
 async def scan_queue_list(queue):
     """File list / CSV entries ko scan karke downloadable items banata hai.
-    Returns: list of dicts {"ch_spec", "ent", "ent_id", "msg_id", "size", "key", "custom_name", "folder_parts"}
+    Returns: list of dicts {"ch_spec", "ent", "ent_id", "msg_id", "size", "key", "custom_name", "folder_parts", "index_id"}
     """
     S["phase"] = "scanning"
     S["scan"] = {"files": 0, "bytes": 0}
     ents = {}
     titles = []
-    # 1. Saare unique channels resolve karo (primary + secondary accounts)
     unique_specs = []
     for it in queue:
         ch = it["channel"]
@@ -1285,10 +1303,9 @@ async def scan_queue_list(queue):
                     a["last_err"] = str(e)[:90]
                     log(f"[{a['name']}] channel resolve fail ({ch}): {e}", "err")
 
-    # 2. Queue items ko expand karke (ch_spec, [(msg_id, meta), ...]) runs banao (order preserve, dedupe)
     done_set = set(S["done_keys"])
     seen = set()
-    wanted_runs = []   # list of (ch_spec, [(msg_id, custom_name, folder_parts), ...])
+    wanted_runs = []   # list of (ch_spec, [(msg_id, custom_name, folder_parts, index_id), ...])
     use_path = S["csv_opts"].get("use_path", True) if S["mode"] == "csv" else False
     use_title = S["csv_opts"].get("use_title", True) if S["mode"] == "csv" else False
 
@@ -1298,16 +1315,17 @@ async def scan_queue_list(queue):
         if it["kind"] in ("link", "csv"):
             cname = (it.get("name") or "") if (it["kind"] == "csv" and use_title) else ""
             fparts = (it.get("folder_parts") or []) if (it["kind"] == "csv" and use_path) else []
-            entries = [(it["msg_id"], cname, fparts)]
+            idx_id = str(it.get("index_id") or "") if it["kind"] == "csv" else ""
+            entries = [(it["msg_id"], cname, fparts, idx_id)]
         else:
-            entries = [(mid, "", []) for mid in range(it["start_id"], it["end_id"] + 1)]
+            entries = [(mid, "", [], "") for mid in range(it["start_id"], it["end_id"] + 1)]
         filtered = []
-        for mid, cname, fparts in entries:
+        for mid, cname, fparts, idx_id in entries:
             key = f"{ent.id}:{mid}"
             if key in seen or key in done_set:
                 continue
             seen.add(key)
-            filtered.append((mid, cname, fparts))
+            filtered.append((mid, cname, fparts, idx_id))
         if not filtered:
             continue
         if wanted_runs and wanted_runs[-1][0] == ch:
@@ -1315,7 +1333,6 @@ async def scan_queue_list(queue):
         else:
             wanted_runs.append((ch, filtered))
 
-    # 3. Har run ke messages 100-100 ke batch me fetch karke media files filter karo
     items, total = [], 0
     for ch, entries in wanted_runs:
         if S["stop"]:
@@ -1330,12 +1347,12 @@ async def scan_queue_list(queue):
             if not isinstance(msgs, list):
                 msgs = [msgs]
             for idx_m, m in enumerate(msgs):
-                _, cname, fparts = chunk[idx_m]
+                _, cname, fparts, idx_id = chunk[idx_m]
                 if m and m.media and m.file and m.file.size:
                     items.append({
                         "ch_spec": ch, "ent": ent, "ent_id": ent.id,
                         "msg_id": m.id, "size": m.file.size, "key": f"{ent.id}:{m.id}",
-                        "custom_name": cname, "folder_parts": fparts,
+                        "custom_name": cname, "folder_parts": fparts, "index_id": idx_id,
                     })
                     total += m.file.size
             S["scan"] = {"files": len(items), "bytes": total}
@@ -1347,7 +1364,6 @@ async def run_once():
     upq = asyncio.Queue(maxsize=1)
     up_task = None
     try:
-        # Purani unused .part files clean karo (active resume file ko chhodkar)
         c = cur_state["cur"]
         keep_names = set()
         if c:
@@ -1394,7 +1410,7 @@ async def run_once():
             list_items = [{
                 "ch_spec": S["channel"], "ent": ent, "ent_id": ent.id,
                 "msg_id": mid, "size": sz, "key": f"{ent.id}:{mid}",
-                "custom_name": "", "folder_parts": [],
+                "custom_name": "", "folder_parts": [], "index_id": "",
             } for mid, sz in raw_items]
             S["plan"] = {"files": len(list_items), "bytes": sum(x["size"] for x in list_items),
                          "dl_files": 0, "dl_bytes": 0, "up_files": 0, "up_bytes": 0}
@@ -1407,9 +1423,9 @@ async def run_once():
                 it = await upq.get()
                 if it is None:
                     return
-                msg_id, path, name, size, key, folder_parts = it
+                msg_id, path, name, size, key, folder_parts, index_id = it
                 try:
-                    ok = await upload_file(msg_id, path, name, size, folder_parts=folder_parts)
+                    ok = await upload_file(msg_id, path, name, size, folder_parts=folder_parts, index_id=index_id)
                     if ok:
                         try:
                             os.remove(path)
@@ -1418,6 +1434,8 @@ async def run_once():
                         if S["mode"] in ("list", "csv"):
                             if key not in S["done_keys"]:
                                 S["done_keys"].append(key)
+                            if index_id:
+                                S["last_index_id"] = index_id
                         else:
                             S["last_done"] = max(S["last_done"], msg_id)
                         S["done_count"] += 1
@@ -1435,8 +1453,8 @@ async def run_once():
 
         up_task = asyncio.create_task(uploader())
         S["phase"] = "transferring"
+        await save_state(True)
 
-        # Same-channel consecutive chunks (max 50) me fresh message fetch + download
         idx = 0
         n_total = len(list_items)
         while idx < n_total and not S["stop"]:
@@ -1462,19 +1480,21 @@ async def run_once():
                 part_name = f"{meta['ent_id']}_{msg.id}.part" if S["mode"] in ("list", "csv") else f"{msg.id}.part"
                 path = os.path.join(DATA_DIR, part_name)
                 pos = idx + k
-                S["next"] = [{"id": x["msg_id"], "size": x["size"], "name": x.get("custom_name", "")}
+                S["next"] = [{"id": x["msg_id"], "size": x["size"], "name": x.get("custom_name", ""), "index_id": x.get("index_id", "")}
                              for x in list_items[pos + 1:pos + 6]]
                 S["dl"] = {"id": msg.id, "name": name, "size": size, "done": 0, "speed": 0,
                            "nseg": 0, "segs_done": 0, "start": time.time(),
-                           "folder": "/".join(meta.get("folder_parts") or [])}
-                log(f"#{msg.id}  {name}  ({fmt(size)})")
+                           "folder": "/".join(meta.get("folder_parts") or []),
+                           "index_id": meta.get("index_id", "")}
+                itag = f" [INDEX #{meta['index_id']}]" if meta.get("index_id") else ""
+                log(f"#{msg.id}{itag}  {name}  ({fmt(size)})")
                 real = await download_msg(msg, size, path, ent_id=meta["ent_id"], channel_spec=ch_spec)
                 if real is None:
                     break
                 S["plan"]["dl_files"] += 1
                 S["plan"]["dl_bytes"] += real
                 S["dl"] = None
-                await upq.put((msg.id, path, name, real, meta["key"], meta.get("folder_parts") or []))
+                await upq.put((msg.id, path, name, real, meta["key"], meta.get("folder_parts") or [], meta.get("index_id", "")))
             idx = end_idx
 
         S["next"] = []
@@ -1482,8 +1502,6 @@ async def run_once():
     except BaseException as e:
         if S["stop"] and not S["failed"]:
             S["status"] = "stopped"
-            if not isinstance(e, Exception):
-                pass
         elif isinstance(e, Exception):
             log(f"JOB ERROR: {type(e).__name__}: {e}", "err")
             S["failed"] = True
@@ -1598,13 +1616,15 @@ def status_json():
         "queue": S["queue"] if S["mode"] == "list" else [],
         "csv_info": csv_summary_view(S["csv_staged"]) if S["csv_staged"].get("items") else None,
         "csv_opts": S["csv_opts"],
-        "channel_title": S["channel_title"], "last_done": S["last_done"],
+        "channel_title": S["channel_title"], "last_done": S["last_done"], "last_index_id": S["last_index_id"],
         "done_count": S["done_count"], "total_bytes": S["total_bytes"],
         "scan": S["scan"], "plan": p, "elapsed": elapsed, "avg": avg, "eta": eta,
         "speed": S["speed"], "rem_files": max(0, p["files"] - p["up_files"]),
         "dl": dl, "ul": S["ul"], "next": S["next"], "accs": accs,
         "hist": list(S["hist"]), "log": list(S["log"]),
         "state_ago": (now - S["state_ts"]) if S["state_ts"] else -1,
+        "state_file": STATE_FILE_NAME,
+        "state_file_id": S["state_file_id"],
         "cryptg": HAS_CRYPTG,
     }
 
@@ -1692,11 +1712,18 @@ button.wabtn{background:#3a2d10;border:1px solid #6e5420;color:var(--wa)}
 .csv-cats{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .csv-cat{padding:5px 10px;font-size:11.5px;border-radius:8px;background:var(--card2);border:1px solid var(--b);color:var(--m);font-weight:600}
 .csv-cat.on{background:#152a4a;border-color:var(--ac);color:#fff}
+.csv-idx-row{display:flex;gap:8px;align-items:flex-end;margin-top:10px;flex-wrap:wrap}
+.csv-idx-row>div{flex:1;min-width:190px}
+.csv-idx-row input{padding:9px 11px;font-size:13.5px}
+.csv-last-hint{font-size:11.5px;color:var(--wa);cursor:pointer;padding:6px 10px;border-radius:8px;background:#2d2210;border:1px solid #6e5420;white-space:nowrap}
 .csv-opts{display:flex;flex-wrap:wrap;gap:14px;margin-top:10px}
 .csv-prev{margin-top:10px;max-height:200px;overflow:auto;background:var(--card2);border:1px solid var(--b);border-radius:10px;padding:6px;display:flex;flex-direction:column;gap:5px}
 .csv-row{background:var(--card);border:1px solid var(--b);border-radius:8px;padding:6px 9px;font-size:12px}
 .csv-row .ct{font-weight:600;color:var(--t);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .csv-row .cp{font-size:11px;color:var(--m);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+.st-ed{width:100%;min-height:220px;font:12px/1.55 ui-monospace,Consolas,monospace;background:#080b12;color:#b8c8e2;border:1px solid var(--b);border-radius:9px;padding:10px}
+.st-link{color:var(--ac);text-decoration:none;font-size:12px;font-weight:600}
+.st-link:hover{text-decoration:underline}
 .stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:12px}
 .st{background:var(--card);border:1px solid var(--b);border-radius:12px;padding:11px 13px}
 .st small{display:block;color:var(--m);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px}
@@ -1780,7 +1807,7 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
 <div id=offlinebar class=offline><svg class="ico" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> connection lost — retrying…</div>
 <div id=toasts></div>
 
-<div id=stopModal class=modal-bg><div class=modal><p>Running transfer rok dein?<br><span style="color:var(--m);font-size:12.5px">Progress safe rehta hai, resume kar sakte ho.</span></p>
+<div id=stopModal class=modal-bg><div class=modal><p>Running transfer rok dein?<br><span style="color:var(--m);font-size:12.5px">Progress Drive me safe rehta hai, resume kar sakte ho.</span></p>
 <div class=btns><button class=stop onclick="closeModal();doStop()"><svg class="ico" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/></svg> Stop</button><button onclick=closeModal() class=sec>Cancel</button></div></div></div>
 
 <div id=driveModal class=modal-bg onclick="if(event.target===this)closeDriveModal()">
@@ -1875,10 +1902,18 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
       </div>
       <div id=csv_meta class=csv-meta></div>
       <div id=csv_cats class=csv-cats></div>
+      <div class=csv-idx-row>
+        <div>
+          <label>Continue from INDEX ID (optional — blank = shuru se)</label>
+          <input id=csv_start_idx placeholder="e.g. 1105 (is INDEX ID se aage upload hoga)" oninput=renderCsv() autocomplete=off>
+        </div>
+        <span id=csv_last_hint class="csv-last-hint hide" onclick=fillNextIndex()></span>
+      </div>
       <div class=csv-opts>
         <label class=fresh><input type=checkbox id=csv_use_path checked> PATH ke hisaab se Drive subfolders banao</label>
         <label class=fresh><input type=checkbox id=csv_use_title checked> NEW TITLE se file rename karo</label>
       </div>
+      <div id=csv_match_info style="margin-top:8px;font-size:12px;color:var(--m)"></div>
       <div id=csv_prev class=csv-prev></div>
     </div>
   </div>
@@ -1937,7 +1972,23 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
 <div id=pane-info class=tabpane>
 <div class=card><h3><span>Overall progress</span><span id=opct2 style="color:var(--t)">0%</span></h3>
 <div class="bar big g"><i id=ob2></i></div><div class=row><span id=o1b></span><span id=o2b></span></div></div>
-<div class=card><h3><span>Lifetime</span></h3><div class=row><span>Total files</span><span id=info_files>0</span></div><div class=row><span>Total data</span><span id=info_bytes>0</span></div><div class=row><span>cryptg</span><span id=info_cryptg>—</span></div></div>
+<div class=card><h3><span>Lifetime</span></h3>
+<div class=row><span>Total files</span><span id=info_files>0</span></div>
+<div class=row><span>Total data</span><span id=info_bytes>0</span></div>
+<div class=row><span>Last CSV INDEX ID</span><span id=info_idx>—</span></div>
+<div class=row><span>cryptg</span><span id=info_cryptg>—</span></div></div>
+
+<div class=card>
+  <h3>
+    <span><svg class="ico" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> Drive State Editor (<span id=st_fname>tg2gd_state.txt</span>)</span>
+    <span class=ac-head-r>
+      <a id=st_dlink class="st-link hide" target=_blank rel=noopener>Open in Drive</a>
+      <button type=button class="sec xs" onclick="loadStateEditor(true)"><svg class="ico ico-sm" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Load from Drive</button>
+      <button type=button class="okbtn xs" onclick=saveStateEditor()><svg class="ico ico-sm" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg> Save to Drive</button>
+    </span>
+  </h3>
+  <textarea id=st_editor class=st-ed placeholder="Click 'Load from Drive' to view/edit tg2gd_state.txt…"></textarea>
+</div>
 </div>
 
 <nav class=tabs id=tabnav>
@@ -1954,7 +2005,7 @@ const ft=s=>{s=Math.round(s);if(!isFinite(s)||s<=0)return '—';const h=Math.flo
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const SVG_PLAY='<svg class="ico" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></svg>',SVG_PAUSE='<svg class="ico" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16" fill="currentColor" stroke="none"/><rect x="14" y="4" width="4" height="16" fill="currentColor" stroke="none"/></svg>',SVG_CHK='<svg class="ico" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>',SVG_FLD='<svg class="ico" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>',SVG_X='<svg class="ico ico-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
 let filled=false,lastMap='',lastLog=[],failStreak=0;
-let curMode='channel',queue=[],folderName='',csvInfo=null,csvCats=new Set(),lastAccs=[];
+let curMode='channel',queue=[],folderName='',csvInfo=null,csvCats=new Set(),lastAccs=[],lastIndexId='';
 
 // -- tabs --
 function showTab(name){document.querySelectorAll('.tabpane').forEach(p=>p.classList.toggle('on',p.id==='pane-'+name));
@@ -2017,13 +2068,35 @@ async function onCsvPick(file){
 }
 async function clearCsv(){
  try{await fetch('/api/csv/clear',{method:'POST'})}catch(e){}
- csvInfo=null;csvCats=new Set();renderCsv();toast('CSV clear ho gayi','warn');
+ csvInfo=null;csvCats=new Set();$('csv_start_idx').value='';renderCsv();toast('CSV clear ho gayi','warn');
 }
 function toggleCsvCat(cat){
  if(!cat){csvCats=new Set()}
  else if(csvCats.has(cat))csvCats.delete(cat);
  else csvCats.add(cat);
  renderCsv();
+}
+function fillNextIndex(){
+ if(!lastIndexId)return;
+ const nextVal=/^\d+$/.test(lastIndexId)?String(+lastIndexId+1):lastIndexId;
+ $('csv_start_idx').value=nextVal;
+ renderCsv();
+ toast('Start INDEX ID set: '+nextVal,'ok');
+}
+function filterCsvPreview(items){
+ let list=items||[];
+ const sidx=($('csv_start_idx').value||'').trim();
+ if(sidx){
+  const exact=list.findIndex(it=>String(it.index_id||'').trim()===sidx);
+  if(exact>=0)list=list.slice(exact);
+  else if(/^\d+$/.test(sidx)){
+   const t=+sidx;
+   const np=list.findIndex(it=>/^\d+$/.test(String(it.index_id||'').trim())&&+it.index_id>=t);
+   list=np>=0?list.slice(np):[];
+  }else list=[];
+ }
+ if(csvCats.size>0)list=list.filter(it=>csvCats.has(it.cat));
+ return list;
 }
 function renderCsv(){
  if(!csvInfo||!csvInfo.total){$('csv_body').classList.add('hide');return}
@@ -2041,8 +2114,39 @@ function renderCsv(){
   $('csv_cats').innerHTML='<button type=button class="csv-cat'+(csvCats.size===0?' on':'')+'" onclick="toggleCsvCat(\'\')">All ('+csvInfo.total+')</button>'+
    ckeys.map(k=>'<button type=button class="csv-cat'+(csvCats.has(k)?' on':'')+'" onclick="toggleCsvCat(\''+esc(k)+'\')">'+esc(k)+' ('+cats[k]+')</button>').join('');
  }else{$('csv_cats').innerHTML=''}
- const prev=(csvInfo.preview||[]).filter(it=>csvCats.size===0||csvCats.has(it.cat));
- $('csv_prev').innerHTML=prev.length?prev.map(it=>'<div class=csv-row><div class=ct title="'+esc(it.name)+'">'+(it.index_id?'#'+esc(it.index_id)+' · ':'')+esc(it.name||('msg #'+it.msg_id))+'</div><div class=cp>'+(it.folder?esc(it.folder)+' · ':'')+(it.size_hint?fb(it.size_hint):'')+(it.cat?' · '+esc(it.cat):'')+'</div></div>').join(''):'<div class=qempty>Is filter me koi file nahi hai</div>';
+ if(lastIndexId){
+  const nxt=/^\d+$/.test(lastIndexId)?(+lastIndexId+1):lastIndexId;
+  $('csv_last_hint').textContent='Last done: #'+lastIndexId+' → Tap for #'+nxt;
+  $('csv_last_hint').classList.remove('hide');
+ }else{$('csv_last_hint').classList.add('hide')}
+ const matched=filterCsvPreview(csvInfo.preview||[]);
+ const sidx=($('csv_start_idx').value||'').trim();
+ $('csv_match_info').textContent='Upload queue preview: '+matched.length+' file'+(matched.length===1?'':'s')+(sidx?' (from INDEX ID '+sidx+')':'')+(matched.length>60?' · showing first 60':'');
+ const show=matched.slice(0,60);
+ $('csv_prev').innerHTML=show.length?show.map(it=>'<div class=csv-row><div class=ct title="'+esc(it.name)+'">'+(it.index_id?'#'+esc(it.index_id)+' · ':'')+esc(it.name||('msg #'+it.msg_id))+'</div><div class=cp>'+(it.folder?esc(it.folder)+' · ':'')+(it.size_hint?fb(it.size_hint):'')+(it.cat?' · '+esc(it.cat):'')+'</div></div>').join(''):'<div class=qempty>Is INDEX ID / filter me koi file nahi mili</div>';
+}
+
+// -- Drive State Editor --
+async function loadStateEditor(fromDrive){
+ try{
+  const r=await fetch('/api/state/raw'+(fromDrive?'?refresh=1':''));
+  const j=await r.json();
+  if(!j.ok){toast(j.error||'State load fail','err');return}
+  $('st_editor').value=j.text||'';
+  if(j.drive_url){$('st_dlink').href=j.drive_url;$('st_dlink').classList.remove('hide')}
+  toast(fromDrive?'Drive se latest state load ho gayi':'State load ho gayi','ok');
+ }catch(e){toast('State load request fail','err')}
+}
+async function saveStateEditor(){
+ const text=$('st_editor').value;
+ if(!text.trim()){toast('State khaali hai','err');return}
+ try{JSON.parse(text)}catch(e){toast('Invalid JSON: '+e.message,'err');return}
+ try{
+  const r=await fetch('/api/state/raw',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+  const j=await r.json();
+  if(j.ok){toast('tg2gd_state.txt Drive me save ho gayi','ok');filled=false;tick()}
+  else toast(j.error||'Save fail','err');
+ }catch(e){toast('Save request fail','err')}
 }
 
 // -- Account Pause / Resume --
@@ -2208,7 +2312,12 @@ async function go(){
  const payload={mode:curMode,folder,folder_name:folderName,fresh:$('in_fr').checked};
  if(curMode==='csv'){
   if(!csvInfo||!csvInfo.total){toast('Pehle CSV file upload karo','err');return}
-  payload.csv_opts={use_path:$('csv_use_path').checked,use_title:$('csv_use_title').checked,cats:Array.from(csvCats)};
+  payload.csv_opts={
+   use_path:$('csv_use_path').checked,
+   use_title:$('csv_use_title').checked,
+   cats:Array.from(csvCats),
+   start_index_id:($('csv_start_idx').value||'').trim()
+  };
  }else if(curMode==='list'){
   if(!queue.length){toast('File list khaali hai — links ya range add karo','err');return}
   payload.queue=queue;
@@ -2243,6 +2352,8 @@ function drawMap(map,n){if(!n){$('map').height=0;lastMap='';return}if(map===last
 const cell=Math.max(3,Math.min(16,Math.floor(Math.sqrt(W*70/n)))),cols=Math.floor(W/(cell+1)),rows=Math.ceil(n/cols);c.width=W;c.height=rows*(cell+1);const x=c.getContext('2d');
 for(let i=0;i<n;i++){const o=parseInt(map.substr(i*2,2),16)||0;x.fillStyle=o==0?'#1a2438':o==255?'#5b6b86':PAL[(o-1)%PAL.length];x.fillRect((i%cols)*(cell+1),Math.floor(i/cols)*(cell+1),cell,cell)}}
 async function tick(){let s;try{const r=await fetch('/api/status');if(r.status==401){location='/login';return}s=await r.json();failStreak=0;$('offlinebar').classList.remove('show')}catch(e){failStreak++;if(failStreak>=2)$('offlinebar').classList.add('show');return}
+const prevLastIdx=lastIndexId;
+lastIndexId=s.last_index_id||'';
 if(!filled&&(s.channel||s.folder||(s.queue&&s.queue.length)||s.csv_info)&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
  if(s.channel)$('in_ch').value=s.channel;
  if(s.folder)$('in_fo').value=s.folder;
@@ -2254,15 +2365,20 @@ if(!filled&&(s.channel||s.folder||(s.queue&&s.queue.length)||s.csv_info)&&!['INP
    $('csv_use_path').checked=s.csv_opts.use_path!==false;
    $('csv_use_title').checked=s.csv_opts.use_title!==false;
    csvCats=new Set(s.csv_opts.cats||[]);
+   if(s.csv_opts.start_index_id)$('csv_start_idx').value=s.csv_opts.start_index_id;
   }
   renderCsv();
  }
  if(s.mode==='list'||s.mode==='csv')setMode(s.mode);
  filled=true;
-}
+}else if(prevLastIdx!==lastIndexId&&csvInfo){renderCsv()}
 const run=s.status=='running';$('st').textContent=s.stopping?'stopping…':s.all_paused&&run?'paused':s.status;$('st').className='pill '+(s.stopping||(s.all_paused&&run)?'stopped':s.status);$('b_go').disabled=run;$('b_st').disabled=!run||s.stopping;
 const scanning=s.phase=='scanning';$('ph').textContent=scanning?('scanning… '+s.scan.files+' files'):(s.phase||'');
-$('ch').textContent=s.channel_title||'';$('sv').textContent=s.state_ago<0?'state: not saved yet':'state saved '+Math.round(s.state_ago)+'s ago (Saved Messages)';
+$('ch').textContent=s.channel_title||'';
+const sf=s.state_file||'tg2gd_state.txt';
+$('st_fname').textContent=sf;
+if(s.state_file_id){$('st_dlink').href='https://drive.google.com/file/d/'+s.state_file_id+'/view';$('st_dlink').classList.remove('hide')}
+$('sv').textContent=s.state_ago<0?'state: not saved yet':'state saved '+Math.round(s.state_ago)+'s ago (Drive: '+sf+')';
 const p=s.plan,dl=s.dl,ul=s.ul;
 $('s1').textContent=p.up_files+' / '+p.files;$('s1b').textContent=fb(p.up_bytes)+' uploaded';
 $('s2').textContent=s.rem_files;$('s2b').textContent=fb(Math.max(0,p.bytes-p.up_bytes))+' left';
@@ -2270,13 +2386,14 @@ $('s3').textContent=fb(s.speed)+'/s';$('s3b').textContent='avg '+fb(s.avg)+'/s �
 $('s4').textContent=fb(ul?ul.speed:0)+'/s';$('s4b').textContent=ul?'uploading now':'idle';$('s5').textContent=ft(s.eta);$('s5b').textContent='download';
 $('s6').textContent=s.elapsed?ft(s.elapsed):'—';$('s6b').textContent='lifetime: '+s.done_count+' files · '+fb(s.total_bytes);
 const pc=p.bytes?Math.min(100,(p.up_bytes+(ul?ul.done:0))/p.bytes*100):0;$('ob').style.width=pc+'%';$('opct').textContent=pc.toFixed(1)+'%';
-$('o1').textContent=fb(p.up_bytes)+' / '+fb(p.bytes);$('o2').textContent='downloaded '+p.dl_files+' files'+(s.mode==='csv'?' · csv mode':s.mode==='list'?' · list mode':' · last done msg #'+s.last_done);
-if(dl){const q=dl.size?dl.done/dl.size*100:0;$('dn').textContent='#'+dl.id+'  '+dl.name;$('dn').title=(dl.folder?dl.folder+'/':'')+dl.name;$('db').style.width=q+'%';$('dt').textContent=fb(dl.done)+' / '+fb(dl.size)+'  @ '+fb(dl.speed)+'/s';
+$('o1').textContent=fb(p.up_bytes)+' / '+fb(p.bytes);
+$('o2').textContent='downloaded '+p.dl_files+' files'+(s.mode==='csv'?(' · csv mode'+(lastIndexId?' · last INDEX #'+lastIndexId:'')):s.mode==='list'?' · list mode':' · last done msg #'+s.last_done);
+if(dl){const q=dl.size?dl.done/dl.size*100:0;$('dn').textContent=(dl.index_id?'[INDEX #'+dl.index_id+'] ':'')+'#'+dl.id+'  '+dl.name;$('dn').title=(dl.folder?dl.folder+'/':'')+dl.name;$('db').style.width=q+'%';$('dt').textContent=fb(dl.done)+' / '+fb(dl.size)+'  @ '+fb(dl.speed)+'/s';
 $('dp').textContent=q.toFixed(1)+'%  ·  '+ft(dl.speed>0?(dl.size-dl.done)/dl.speed:0);$('dseg').textContent=dl.nseg?dl.segs_done+' / '+dl.nseg+' segments':'';drawMap(dl.map||'',dl.nseg)}
 else{$('dn').textContent=scanning?'scanning…':'—';$('db').style.width=0;$('dt').textContent=$('dp').textContent=$('dseg').textContent='';drawMap('',0)}
-if(ul){const q=ul.size?ul.done/ul.size*100:0;$('un').textContent='#'+ul.id+'  '+ul.name;$('un').title=(ul.folder?ul.folder+'/':'')+ul.name;$('uspd').textContent=fb(ul.speed)+'/s';$('ub').style.width=q+'%';$('ut').textContent=fb(ul.done)+' / '+fb(ul.size)+'  @ '+fb(ul.speed)+'/s';$('up').textContent=q.toFixed(1)+'%  ·  '+ft(ul.speed>0?(ul.size-ul.done)/ul.speed:0)}
+if(ul){const q=ul.size?ul.done/ul.size*100:0;$('un').textContent=(ul.index_id?'[INDEX #'+ul.index_id+'] ':'')+'#'+ul.id+'  '+ul.name;$('un').title=(ul.folder?ul.folder+'/':'')+ul.name;$('uspd').textContent=fb(ul.speed)+'/s';$('ub').style.width=q+'%';$('ut').textContent=fb(ul.done)+' / '+fb(ul.size)+'  @ '+fb(ul.speed)+'/s';$('up').textContent=q.toFixed(1)+'%  ·  '+ft(ul.speed>0?(ul.size-ul.done)/ul.speed:0)}
 else{$('un').textContent='—';$('uspd').textContent='';$('ub').style.width=0;$('ut').textContent=$('up').textContent=''}
-$('nx').innerHTML=s.next.length?s.next.map(n=>'<span>#'+n.id+(n.name?' · '+esc(n.name.slice(0,36)):'')+' · '+fb(n.size)+'</span>').join(''):'<span>—</span>';
+$('nx').innerHTML=s.next.length?s.next.map(n=>'<span>'+(n.index_id?'IDX #'+esc(n.index_id)+' · ':'#'+n.id+' · ')+(n.name?esc(n.name.slice(0,32))+' · ':'')+fb(n.size)+'</span>').join(''):'<span>—</span>';
 lastAccs=s.accs||[];
 const pCnt=lastAccs.filter(a=>a.paused&&a.status!=='dead').length;
 const mxs=Math.max(2097152,...lastAccs.map(a=>a.speed));
@@ -2293,7 +2410,7 @@ return '<div class="ac'+(a.paused&&!dead?' paused':'')+'"><div class=h><span cla
 drawChart(s.hist);
 lastLog=s.log;renderLog();
 $('opct2').textContent=$('opct').textContent;$('ob2').style.width=$('ob').style.width;$('o1b').textContent=$('o1').textContent;$('o2b').textContent=$('o2').textContent;
-$('info_files').textContent=s.done_count;$('info_bytes').textContent=fb(s.total_bytes);$('info_cryptg').textContent=s.cryptg?'OK (fast decrypt)':'off (slower)';
+$('info_files').textContent=s.done_count;$('info_bytes').textContent=fb(s.total_bytes);$('info_idx').textContent=lastIndexId?('#'+lastIndexId):'—';$('info_cryptg').textContent=s.cryptg?'OK (fast decrypt)':'off (slower)';
 }
 setInterval(tick,1000);tick();
 window.addEventListener('online',()=>{failStreak=0;$('offlinebar').classList.remove('show');tick()});
@@ -2339,6 +2456,53 @@ async def h_status(req):
     return web.json_response(status_json())
 
 
+async def h_state_raw_get(req):
+    global STATE_FILE_ID
+    if not authed(req):
+        return web.Response(status=401)
+    if req.query.get("refresh") == "1":
+        try:
+            fid, _, raw_txt = await asyncio.to_thread(drive_load_state_sync)
+            if fid:
+                STATE_FILE_ID = fid
+                S["state_file_id"] = fid
+                return web.json_response({
+                    "ok": True, "file_id": fid, "filename": STATE_FILE_NAME,
+                    "drive_url": f"https://drive.google.com/file/d/{fid}/view",
+                    "text": raw_txt,
+                })
+        except Exception as e:
+            return web.json_response({"ok": False, "error": str(e)[:200]})
+    txt = json.dumps({**state_dict(), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2, ensure_ascii=False)
+    fid = STATE_FILE_ID or ""
+    return web.json_response({
+        "ok": True, "file_id": fid, "filename": STATE_FILE_NAME,
+        "drive_url": f"https://drive.google.com/file/d/{fid}/view" if fid else "",
+        "text": txt,
+    })
+
+
+async def h_state_raw_post(req):
+    if not authed(req):
+        return web.Response(status=401)
+    if JOB and not JOB.done():
+        return web.json_response({"ok": False, "error": "Pehle chal raha transfer Stop karo, phir state edit karo"})
+    d = await req.json()
+    text = d.get("text") or ""
+    try:
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            return web.json_response({"ok": False, "error": "State valid JSON object ({...}) honi chahiye"})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": f"Invalid JSON: {e}"})
+    apply_state_dict(parsed)
+    ok = await save_state(True)
+    if not ok:
+        return web.json_response({"ok": False, "error": "Drive me save fail ho gaya (logs dekho)"})
+    log(f"Drive state ({STATE_FILE_NAME}) manually update ho gayi", "ok")
+    return web.json_response({"ok": True})
+
+
 async def h_csv_parse(req):
     if not authed(req):
         return web.Response(status=401)
@@ -2358,8 +2522,8 @@ async def h_csv_parse(req):
             text = d.get("text") or ""
         parsed = parse_csv_text(text, filename=fname)
         S["csv_staged"] = parsed
-        save_csv_staged()
-        log(f"CSV parsed: {parsed['filename']} ({len(parsed['items'])} files, {parsed['folders_count']} folders)", "ok")
+        await save_state(True)
+        log(f"CSV parsed & saved to Drive: {parsed['filename']} ({len(parsed['items'])} files, {parsed['folders_count']} folders)", "ok")
         return web.json_response({"ok": True, "csv": csv_summary_view(parsed)})
     except Exception as e:
         return web.json_response({"ok": False, "error": str(e)[:200]})
@@ -2368,12 +2532,9 @@ async def h_csv_parse(req):
 async def h_csv_clear(req):
     if not authed(req):
         return web.Response(status=401)
-    S["csv_staged"] = {"filename": "", "items": [], "skipped": 0, "categories": {}, "folders_count": 0, "channels": [], "total_bytes": 0}
-    try:
-        if os.path.exists(CSV_STAGED_FILE):
-            os.remove(CSV_STAGED_FILE)
-    except OSError:
-        pass
+    S["csv_staged"] = empty_csv_staged()
+    S["csv_opts"]["start_index_id"] = ""
+    await save_state(True)
     return web.json_response({"ok": True})
 
 
@@ -2388,12 +2549,15 @@ async def h_account_pause(req):
         for k, a in S["accs"].items():
             if a["status"] != "dead":
                 set_account_paused(k, target)
+        await save_state(True)
         return web.json_response({"ok": True, "id": "__all__", "paused": target})
     if aid not in S["accs"]:
         return web.json_response({"ok": False, "error": "Account nahi mila"})
     if paused is None:
         paused = not S["accs"][aid]["paused"]
     ok, err = set_account_paused(aid, bool(paused))
+    if ok:
+        await save_state(True)
     return web.json_response({"ok": ok, "id": aid, "paused": S["accs"][aid]["paused"], "error": err})
 
 
@@ -2440,8 +2604,8 @@ async def h_drive_info(req):
 
 
 def reset_progress():
-    """Purana progress (last_done, done_keys, cur, .part files) saaf - naye channel/fresh upload ke liye."""
-    S.update(last_done=0, done_count=0, total_bytes=0, _ent_id=None, channel_title="", done_keys=[])
+    """Purana progress (last_done, last_index_id, done_keys, cur, .part files) saaf - naye channel/fresh upload ke liye."""
+    S.update(last_done=0, last_index_id="", done_count=0, total_bytes=0, _ent_id=None, channel_title="", done_keys=[])
     S["scan"] = {"files": 0, "bytes": 0}
     cur_state["cur"] = None
     save_state.last = None
@@ -2465,21 +2629,24 @@ async def start_job(mode="channel", channel="", folder="", folder_name="", start
         use_path = bool(opts.get("use_path", True))
         use_title = bool(opts.get("use_title", True))
         cats = [str(c) for c in (opts.get("cats") or []) if str(c).strip()]
-        cat_set = set(cats)
+        start_index_id = str(opts.get("start_index_id") or "").strip()
         src_items = queue if queue else (S["csv_staged"].get("items") or [])
-        if cat_set:
-            src_items = [it for it in src_items if it.get("cat") in cat_set]
-        q = normalize_queue(src_items)
+        filtered_items = filter_csv_items(src_items, cats=cats, start_index_id=start_index_id)
+        q = normalize_queue(filtered_items)
         if not q:
+            if start_index_id:
+                return False, f"INDEX ID '{start_index_id}' ke baad koi matching file nahi mili"
             return False, "CSV me koi matching file nahi mili — pehle CSV upload karo"
-        if fresh or S["mode"] != "csv":
-            if fresh:
-                log("fresh start: purana CSV progress clear kiya", "warn")
-                with FOLDER_LOCK:
-                    FOLDER_CACHE.clear()
+        if fresh:
+            log("fresh start: purana CSV progress clear kiya", "warn")
             S["done_keys"] = []
+            S["last_index_id"] = ""
             cur_state["cur"] = None
-        S["csv_opts"] = {"use_path": use_path, "use_title": use_title, "cats": cats}
+            with FOLDER_LOCK:
+                FOLDER_CACHE.clear()
+        elif S["mode"] != "csv":
+            cur_state["cur"] = None
+        S["csv_opts"] = {"use_path": use_path, "use_title": use_title, "cats": cats, "start_index_id": start_index_id}
         S.update(mode="csv", queue=q, folder=folder, folder_name=folder_name)
     elif mode == "list":
         q = normalize_queue(queue)
@@ -2498,7 +2665,7 @@ async def start_job(mode="channel", channel="", folder="", folder_name="", start
             log("fresh start: purana progress (last_done / cache) clear kiya", "warn")
             reset_progress()
         S.update(mode="channel", channel=channel, folder=folder, folder_name=folder_name, start_id=start_id)
-    save_local_job_store()
+    await save_state(True)
     JOB = asyncio.create_task(run_job())
     return True, ""
 
@@ -2569,11 +2736,10 @@ async def startup_checks():
 
 
 async def on_start(app):
-    global PRIMARY, PRIMARY_AID
+    global PRIMARY, PRIMARY_AID, STATE_FILE_ID, STATE_LOCK
+    STATE_LOCK = asyncio.Lock()
     cfg = load_json("ACCOUNTS_JSON", "accounts.json")
     ticked = set(cfg.get("par", {}).get("ticked", [a["id"] for a in cfg["list"]]))
-    saved_paused = load_paused_accs()
-    load_csv_staged()
     for a in cfg["list"]:
         if a["id"] not in ticked:
             continue
@@ -2590,7 +2756,7 @@ async def on_start(app):
         CLIENTS[a["id"]] = cl
         S["accs"][a["id"]] = {"idx": len(S["accs"]), "name": a["name"], "phone": a["phone"], "bytes": 0,
                               "speed": 0, "segs": 0, "conn": CONN,
-                              "status": "ok", "paused": (a["id"] in saved_paused),
+                              "status": "ok", "paused": False,
                               "flood_until": 0, "floods": 0, "errors": 0, "last_err": ""}
         if a["id"] == cfg.get("active") or PRIMARY is None:
             PRIMARY, PRIMARY_AID = cl, a["id"]
@@ -2600,47 +2766,32 @@ async def on_start(app):
     log(f"UI: http://localhost:{PORT}  (password: {PASSWORD})")
     app["tasks"] = [asyncio.create_task(speed_loop())]
     await startup_checks()
-    log("saved state dhoond raha hoon (Saved Messages)...")
+    log(f"saved state dhoond raha hoon (Drive root: {STATE_FILE_NAME})...")
+    st = None
     try:
-        st = await asyncio.wait_for(load_state(), 60)
+        fid, st, _ = await asyncio.wait_for(asyncio.to_thread(drive_load_state_sync), 60)
+        if fid:
+            STATE_FILE_ID = fid
+            S["state_file_id"] = fid
     except Exception as e:
-        log(f"state load fail/timeout: {e}", "warn")
+        log(f"drive state load fail/timeout: {e}", "warn")
         st = None
-    local_st = _read_json_safe(JOB_STORE_FILE) or {}
-    if st or local_st:
-        src = st or local_st
-        mode = src.get("mode", "channel")
-        # Local job_store me full queue & done_keys hoti hain (Telegram 4096 char limit se bachne ke liye)
-        q_saved = local_st.get("queue") if (local_st.get("mode") == mode and local_st.get("queue")) else src.get("queue", [])
-        dk_saved = list(dict.fromkeys((local_st.get("done_keys") or []) + (src.get("done_keys") or [])))
-        S.update(
-            mode=mode,
-            channel=src.get("channel", local_st.get("channel", "")),
-            folder=src.get("folder", local_st.get("folder", "")),
-            folder_name=src.get("folder_name", local_st.get("folder_name", "")),
-            queue=q_saved,
-            done_keys=dk_saved,
-            last_done=max(src.get("last_done", 0), local_st.get("last_done", 0)),
-            done_count=max(src.get("done_count", 0), local_st.get("done_count", 0)),
-            total_bytes=max(src.get("total_bytes", 0), local_st.get("total_bytes", 0)),
-        )
-        if isinstance(src.get("csv_opts") or local_st.get("csv_opts"), dict):
-            S["csv_opts"] = src.get("csv_opts") or local_st.get("csv_opts")
-        cur_state["cur"] = src.get("cur") or local_st.get("cur")
-        log(f"saved state mila: mode={S['mode']}, last_done={S['last_done']}, done={S['done_count']}", "ok")
-        if st and st.get("running"):
+    if st:
+        apply_state_dict(st)
+        log(f"Drive state mila ({STATE_FILE_NAME}): mode={S['mode']}, done={S['done_count']}, last_idx={S['last_index_id'] or '-'}", "ok")
+        if st.get("running"):
             if S["mode"] == "csv" and (S["queue"] or S["csv_staged"].get("items")):
-                log("crash se pehle CSV mode running tha -> auto resume", "warn")
+                log("restart se pehle CSV mode running tha -> auto resume", "warn")
                 await start_job(mode="csv", folder=S["folder"], folder_name=S["folder_name"],
                                 queue=S["queue"] or None, csv_opts=S["csv_opts"])
             elif S["mode"] == "list" and S["queue"]:
-                log("crash se pehle list mode running tha -> auto resume", "warn")
+                log("restart se pehle list mode running tha -> auto resume", "warn")
                 await start_job(mode="list", folder=S["folder"], folder_name=S["folder_name"], queue=S["queue"])
             elif S["mode"] == "channel" and S["channel"]:
-                log("crash se pehle running tha -> auto resume", "warn")
-                await start_job(mode="channel", channel=S["channel"], folder=S["folder"], folder_name=S["folder_name"], start_id=0)
+                log("restart se pehle channel mode running tha -> auto resume", "warn")
+                await start_job(mode="channel", channel=S["channel"], folder=S["folder"], folder_name=S["folder_name"], start_id=S["start_id"])
     else:
-        log("koi purana state nahi mila -> fresh start")
+        log(f"Drive root me {STATE_FILE_NAME} nahi mili -> fresh start")
     app["tasks"].append(asyncio.create_task(state_loop()))
 
 
@@ -2650,6 +2801,8 @@ def main():
         web.get("/", h_index),
         web.route("*", "/login", h_login),
         web.get("/api/status", h_status),
+        web.get("/api/state/raw", h_state_raw_get),
+        web.post("/api/state/raw", h_state_raw_post),
         web.post("/api/start", h_start),
         web.post("/api/stop", h_stop),
         web.post("/api/csv/parse", h_csv_parse),
