@@ -2,7 +2,7 @@
 Telegram -> (Render/PC disk) -> Google Drive   |  multi-account, resumable, live UI
 
 Features:
-- Full Channel mode (start msg ID se auto-scan + resumable)
+- Full Channel mode (start msg ID + optional end msg ID range e.g. 1 to 10 se auto-scan + resumable)
 - File List / Queue mode (per-file Telegram links ya specific channel ki Msg ID range se list banakar upload)
 - CSV Import mode (id_link, NEW TITLE, PATH, TYPE, size_bytes, INDEX ID wali CSV se auto subfolder tree, rename, aur Continue from Specific INDEX ID)
 - Per-Account Pause / Resume (kisi bhi account ko live pause/resume karo bina baaki accounts roke)
@@ -179,7 +179,7 @@ def empty_csv_staged():
 # ------------------------------------------------------------------ global state
 S = {
     "status": "idle", "phase": "", "mode": "channel",
-    "channel": "", "channel_title": "", "folder": "", "folder_name": "", "start_id": 0,
+    "channel": "", "channel_title": "", "folder": "", "folder_name": "", "start_id": 0, "end_id": 0,
     "queue": [], "done_keys": [],
     "csv_staged": empty_csv_staged(),
     "csv_opts": {"use_path": True, "use_title": True, "cats": [], "start_index_id": ""},
@@ -557,6 +557,7 @@ def state_dict():
         "folder": S["folder"],
         "folder_name": S["folder_name"],
         "start_id": S["start_id"],
+        "end_id": S["end_id"],
         "last_done": S["last_done"],
         "last_index_id": S["last_index_id"],
         "done_count": S["done_count"],
@@ -625,6 +626,7 @@ def apply_state_dict(d):
         folder=str(d.get("folder") or ""),
         folder_name=str(d.get("folder_name") or ""),
         start_id=int(d.get("start_id") or 0),
+        end_id=int(d.get("end_id") or 0),
         last_done=int(d.get("last_done") or 0),
         last_index_id=str(d.get("last_index_id") or ""),
         done_count=int(d.get("done_count") or 0),
@@ -1651,21 +1653,27 @@ async def upload_file(msg_id, path, name, size, folder_parts=None, index_id=""):
 
 
 # ------------------------------------------------------------------ job (channel mode + file list + csv mode)
-async def scan_channel(ent, min_id):
+async def scan_channel(ent, min_id, max_id=0):
     S["phase"] = "scanning"
     items, cursor, total = [], min_id, 0
     while not S["stop"]:
         cur = cursor
+        if max_id and cur >= max_id:
+            break
         batch = await flood_safe(lambda: PRIMARY.get_messages(ent, limit=100, min_id=cur, reverse=True), "primary")
         if not batch:
             break
+        hit_end = False
         for m in batch:
+            if max_id and m.id > max_id:
+                hit_end = True
+                break
             if m.media and m.file and m.file.size:
                 items.append((m.id, m.file.size))
                 total += m.file.size
         cursor = max(m.id for m in batch)
         S["scan"] = {"files": len(items), "bytes": total}
-        if len(batch) < 100:
+        if hit_end or len(batch) < 100:
             break
     return items
 
@@ -1812,8 +1820,13 @@ async def run_once():
                         a["last_err"] = str(e)[:90]
                         log(f"[{a['name']}] channel resolve fail: {e}", "err")
             min_id = max(S["last_done"], S["start_id"] - 1 if S["start_id"] else 0)
-            log(f"channel: {S['channel_title']}  | {min_id} ke baad se scan", "ok")
-            raw_items = await scan_channel(ent, min_id)
+            max_id = int(S.get("end_id") or 0)
+            if max_id:
+                rng_lbl = f"msg #{min_id + 1}–#{max_id}" if min_id < max_id else f"range #{S['start_id'] or 1}–#{max_id} (done till #{min_id})"
+            else:
+                rng_lbl = f"{min_id} ke baad se"
+            log(f"channel: {S['channel_title']}  | {rng_lbl} scan", "ok")
+            raw_items = await scan_channel(ent, min_id, max_id=max_id)
             list_items = [{
                 "ch_spec": S["channel"], "ent": ent, "ent_id": ent.id,
                 "msg_id": mid, "size": sz, "key": f"{ent.id}:{mid}",
@@ -2043,7 +2056,7 @@ def status_json():
         "mode": S["mode"],
         "stopping": bool(S["stop"] and S["status"] == "running"),
         "all_paused": all_paused,
-        "channel": S["channel"], "folder": S["folder"], "folder_name": S["folder_name"],
+        "channel": S["channel"], "start_id": S["start_id"], "end_id": S["end_id"], "folder": S["folder"], "folder_name": S["folder_name"],
         "queue": S["queue"] if S["mode"] == "list" else [],
         "csv_info": csv_summary_view(S["csv_staged"]) if S["csv_staged"].get("items") else None,
         "csv_opts": S["csv_opts"],
@@ -2108,6 +2121,7 @@ h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.2px}h1 span{color:var
 .modebar button{background:none;color:var(--m);padding:9px 8px;font-size:12.5px;border-radius:8px;font-weight:600}
 .modebar button.on{background:var(--ac);color:#fff}
 .ctl{display:grid;grid-template-columns:1fr;gap:10px}
+.ctl-ch{grid-template-columns:1fr 1fr}.ctl-ch>div:first-child{grid-column:1/-1}
 label{font-size:11.5px;color:var(--m);display:block;margin-bottom:5px}
 input,textarea{width:100%;background:var(--card2);border:1px solid var(--b);color:var(--t);border-radius:10px;padding:11px 12px;font-size:15px;font-family:inherit;outline:none}
 textarea{resize:vertical;min-height:74px;font-size:13.5px;line-height:1.45}
@@ -2250,7 +2264,7 @@ button{display:inline-flex;align-items:center;justify-content:center;gap:6px}
 @media(min-width:640px){.w{max-width:1100px;padding:18px 16px 40px}header{position:static;background:none;backdrop-filter:none;border:0;margin:0 0 14px;padding:0}
 .offline{margin:0 0 12px;border-radius:10px}
 nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
-.sub{max-width:none}.ctl-ch{grid-template-columns:2fr 130px;align-items:end}.qgrid{grid-template-columns:1fr 1fr}.fresh{margin:0}
+.sub{max-width:none}.ctl-ch{grid-template-columns:2fr 130px 150px;align-items:end}.ctl-ch>div:first-child{grid-column:auto}.qgrid{grid-template-columns:1fr 1fr}.fresh{margin:0}
 .stats{grid-template-columns:repeat(6,1fr)}.two{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
 #log{height:230px}}
 </style></head><body>
@@ -2358,7 +2372,8 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
   <!-- Mode 1: Full Channel -->
   <div id=box_ch class="ctl ctl-ch" style="margin-bottom:10px">
     <div><label>Channel (@username / invite link / id)</label><input id=in_ch placeholder="https://t.me/+xxxxxxxx" autocomplete=off autocorrect=off autocapitalize=off></div>
-    <div><label>Start msg ID</label><input id=in_si type=number inputmode=numeric value=0 min=0></div>
+    <div><label>Start msg ID</label><input id=in_si type=number inputmode=numeric value=0 min=0 placeholder="e.g. 1" oninput=persist()></div>
+    <div><label>End msg ID (optional)</label><input id=in_ei type=number inputmode=numeric value=0 min=0 placeholder="0 = end tak" oninput=persist()></div>
   </div>
 
   <!-- Mode 2: File List / Queue -->
@@ -2925,6 +2940,8 @@ async function doStop(){try{await fetch('/api/stop',{method:'POST'});toast('Stop
 try{
  const saved=JSON.parse(localStorage.getItem('tg2gd_last')||'{}');
  if(saved.channel)$('in_ch').value=saved.channel;
+ if(saved.start_id!==undefined)$('in_si').value=saved.start_id;
+ if(saved.end_id!==undefined)$('in_ei').value=saved.end_id;
  if(saved.folder)$('in_fo').value=saved.folder;
  if(saved.folder_name)folderName=saved.folder_name;
  if(Array.isArray(saved.queue))queue=saved.queue;
@@ -2935,7 +2952,7 @@ try{
 }catch(e){}
 function persist(){
  try{localStorage.setItem('tg2gd_last',JSON.stringify({
-  mode:curMode,channel:$('in_ch').value,folder:$('in_fo').value,folder_name:folderName,queue,
+  mode:curMode,channel:$('in_ch').value,start_id:+$('in_si').value||0,end_id:+$('in_ei').value||0,folder:$('in_fo').value,folder_name:folderName,queue,
   enc_enabled:$('in_enc').checked,enc_pass:$('in_enc_pass').value
  }))}catch(e){}
 }
@@ -2959,8 +2976,11 @@ async function go(){
  }else{
   const channel=$('in_ch').value.trim();
   if(!channel){toast('Channel daalo pehle','err');return}
+  let si=+$('in_si').value||0,ei=+$('in_ei').value||0;
+  if(si>0&&ei>0&&si>ei){const t=si;si=ei;ei=t;$('in_si').value=si;$('in_ei').value=ei}
   payload.channel=channel;
-  payload.start_id=+$('in_si').value||0;
+  payload.start_id=si;
+  payload.end_id=ei;
  }
  persist();
  $('b_go').disabled=true;
@@ -2991,6 +3011,8 @@ const prevLastIdx=lastIndexId;
 lastIndexId=s.last_index_id||'';
 if(!filled&&(s.channel||s.folder||(s.queue&&s.queue.length)||s.csv_info)&&!['INPUT','TEXTAREA'].includes(document.activeElement.tagName)){
  if(s.channel)$('in_ch').value=s.channel;
+ if(s.start_id!==undefined)$('in_si').value=s.start_id;
+ if(s.end_id!==undefined)$('in_ei').value=s.end_id;
  if(s.folder)$('in_fo').value=s.folder;
  if(s.folder_name){folderName=s.folder_name;renderFolderBadge()}
  if(s.queue&&s.queue.length&&!queue.length){queue=s.queue;renderQueue()}
@@ -3037,7 +3059,7 @@ $('s4').textContent=fb(ul?ul.speed:0)+'/s';$('s4b').textContent=ul?'uploading no
 $('s6').textContent=s.elapsed?ft(s.elapsed):'—';$('s6b').textContent='lifetime: '+s.done_count+' files · '+fb(s.total_bytes);
 const pc=p.bytes?Math.min(100,(p.up_bytes+(ul?ul.done:0))/p.bytes*100):0;$('ob').style.width=pc+'%';$('opct').textContent=pc.toFixed(1)+'%';
 $('o1').textContent=fb(p.up_bytes)+' / '+fb(p.bytes);
-$('o2').textContent='downloaded '+p.dl_files+' files'+(s.mode==='csv'?(' · csv mode'+(lastIndexId?' · last INDEX #'+lastIndexId:'')):s.mode==='list'?' · list mode':' · last done msg #'+s.last_done);
+$('o2').textContent='downloaded '+p.dl_files+' files'+(s.mode==='csv'?(' · csv mode'+(lastIndexId?' · last INDEX #'+lastIndexId:'')):s.mode==='list'?' · list mode':((s.end_id>0?' · range #'+(s.start_id||1)+'–#'+s.end_id:'')+' · last done msg #'+s.last_done));
 if(dl){const q=dl.size?dl.done/dl.size*100:0;$('dn').textContent=(dl.index_id?'[INDEX #'+dl.index_id+'] ':'')+'#'+dl.id+'  '+dl.name;$('dn').title=(dl.folder?dl.folder+'/':'')+dl.name;$('db').style.width=q+'%';$('dt').textContent=fb(dl.done)+' / '+fb(dl.size)+'  @ '+fb(dl.speed)+'/s';
 $('dp').textContent=q.toFixed(1)+'%  ·  '+ft(dl.speed>0?(dl.size-dl.done)/dl.speed:0);$('dseg').textContent=dl.nseg?dl.segs_done+' / '+dl.nseg+' segments':'';drawMap(dl.map||'',dl.nseg)}
 else{$('dn').textContent=scanning?'scanning…':'—';$('db').style.width=0;$('dt').textContent=$('dp').textContent=$('dseg').textContent='';drawMap('',0)}
@@ -3451,7 +3473,7 @@ def reset_progress():
         pass
 
 
-async def start_job(mode="channel", channel="", folder="", folder_name="", start_id=0, queue=None, csv_opts=None, fresh=False, enc_enabled=None, enc_pass=None):
+async def start_job(mode="channel", channel="", folder="", folder_name="", start_id=0, end_id=0, queue=None, csv_opts=None, fresh=False, enc_enabled=None, enc_pass=None):
     global JOB
     if JOB and not JOB.done():
         return False, "Pehle se chal raha hai"
@@ -3498,10 +3520,16 @@ async def start_job(mode="channel", channel="", folder="", folder_name="", start
     else:
         if not channel:
             return False, "Channel daalo pehle"
-        if fresh or S["mode"] != "channel" or (S["channel"] and S["channel"].strip() != channel.strip()):
+        start_id = max(0, int(start_id or 0))
+        end_id = max(0, int(end_id or 0))
+        if start_id > 0 and end_id > 0 and start_id > end_id:
+            start_id, end_id = end_id, start_id
+        ch_changed = bool(S["channel"] and S["channel"].strip() != channel.strip())
+        start_changed = (S["start_id"] != start_id) and (S["last_done"] > 0 or cur_state["cur"])
+        if fresh or S["mode"] != "channel" or ch_changed or start_changed:
             log("fresh start: purana progress (last_done / cache) clear kiya", "warn")
             reset_progress()
-        S.update(mode="channel", channel=channel, folder=folder, folder_name=folder_name, start_id=start_id)
+        S.update(mode="channel", channel=channel, folder=folder, folder_name=folder_name, start_id=start_id, end_id=end_id)
     await save_state(True)
     JOB = asyncio.create_task(run_job())
     return True, ""
@@ -3520,6 +3548,7 @@ async def h_start(req):
         folder=folder,
         folder_name=folder_name,
         start_id=int(d.get("start_id") or 0),
+        end_id=int(d.get("end_id") or 0),
         queue=d.get("queue"),
         csv_opts=d.get("csv_opts"),
         fresh=bool(d.get("fresh")),
@@ -3635,7 +3664,7 @@ async def on_start(app):
                     await start_job(mode="list", folder=S["folder"], folder_name=S["folder_name"], queue=S["queue"])
                 elif S["mode"] == "channel" and S["channel"]:
                     log("restart se pehle channel mode running tha -> auto resume", "warn")
-                    await start_job(mode="channel", channel=S["channel"], folder=S["folder"], folder_name=S["folder_name"], start_id=S["start_id"])
+                    await start_job(mode="channel", channel=S["channel"], folder=S["folder"], folder_name=S["folder_name"], start_id=S["start_id"], end_id=S["end_id"])
         else:
             log(f"Drive root me {STATE_FILE_NAME} nahi mili -> fresh start")
     else:
