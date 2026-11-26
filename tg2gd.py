@@ -8,22 +8,35 @@ Features:
 - Per-Account Pause / Resume (kisi bhi account ko live pause/resume karo bina baaki accounts roke)
 - Google Drive Root State (tg2gd_state.txt — Render restart safe, no 4KB limit, built-in online State Editor in UI)
 - Google Drive Folder Picker & Creator Pop-up (link paste karna zaruri nahi, seedha Drive se select ya create karo)
+- Built-in Google Drive OAuth Re-Login (token expire / invalid_grant hone par seedha Web UI se ya CLI `--get-token` se wapis login karke naya token banao)
+- Automated 7z Store Mode Encryption (per-file .7z, no compression, simple password + header lock; native 7z CLI ya py7zr hybrid)
 
 Chalane ke liye (Windows / Linux / Render):
-    python tg2gd.py
+    python tg2gd.py                    (normal server + Web UI)
+    python tg2gd.py --get-token        (sirf naya Google Drive token banana ho, default PORT)
+    python tg2gd.py --get-token 8085   (alag port par token banana ho)
+
 Missing packages khud install ho jaate hain. Same folder me accounts.json + token.json rakho
-(ya env: ACCOUNTS_JSON / TOKEN_JSON, Render Secret Files: /etc/secrets/).
+(ya env: ACCOUNTS_JSON / TOKEN_JSON / GOOGLE_CREDENTIALS_JSON, Render Secret Files: /etc/secrets/).
 
 Env (sab optional):
     PORT=8080  DATA_DIR=./data  APP_PASSWORD=808177  STATE_INTERVAL=10  STATE_FILE_NAME=tg2gd_state.txt
     CONN=1 (har account ke max parallel connections)  MAX_MBPS=2 (har account ki max download speed, MB/s; 0 = unlimited)
+    OAUTH_REDIRECT_URI= (optional custom OAuth redirect URI)
 """
-import os, sys, re, io, csv, json, time, asyncio, secrets, logging, collections, shutil, subprocess, importlib, threading
+import os, sys, re, io, csv, json, glob, time, asyncio, secrets, logging, collections, shutil, subprocess, importlib, threading
+from urllib.parse import urlparse, parse_qs
 
 
 def ensure_deps():
-    need = {"aiohttp": "aiohttp", "telethon": "telethon",
-            "googleapiclient": "google-api-python-client", "google.auth": "google-auth"}
+    need = {
+        "aiohttp": "aiohttp",
+        "telethon": "telethon",
+        "googleapiclient": "google-api-python-client",
+        "google.auth": "google-auth",
+        "google_auth_oauthlib": "google-auth-oauthlib",
+        "py7zr": "py7zr",
+    }
     miss = []
     for mod, pkg in need.items():
         try:
@@ -51,18 +64,36 @@ def ensure_deps():
 
 HAS_CRYPTG = ensure_deps()
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
+
+def env_files():
+    fs = [os.path.join(HERE, ".env")] + sorted(glob.glob(os.path.join(HERE, "*.env")))
+    out = []
+    for f in fs:
+        if os.path.exists(f) and f not in out:
+            out.append(f)
+    return out
+
+
+def read_env_value(key):
+    for f in env_files():
+        for line in open(f, encoding="utf-8-sig"):
+            line = line.strip()
+            if line.startswith(key + "="):
+                v = line.split("=", 1)[1].strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                    v = v[1:-1]
+                return v
+    return None
+
 
 def load_dotenv():
     """Script ke folder ki .env aur har *.env file (jaise TELE-SERVICE-DRIVE.env) padh kar os.environ me daalta hai
     (pehle se set env vars ko override nahi karta)."""
-    import glob
-    here = os.path.dirname(os.path.abspath(__file__))
-    files = [os.path.join(here, ".env")] + sorted(glob.glob(os.path.join(here, "*.env")))
-    seen = set()
-    for p in files:
-        if p in seen or not os.path.exists(p):
-            continue
-        seen.add(p)
+    for p in env_files():
         for line in open(p, encoding="utf-8-sig"):
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -88,6 +119,7 @@ FLOOD = (FloodWaitError, FloodPremiumWaitError)          # dono ko ek jaisa Floo
 from telethon.sessions import StringSession
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import Flow, InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
 
@@ -119,6 +151,10 @@ except OSError:
 
 FOLDER_CACHE = {}
 FOLDER_LOCK = threading.Lock()
+TOKEN_LOCK = threading.Lock()
+_LIVE_TOKEN = None
+_CACHED_CREDS = None
+OAUTH_FLOWS = {}   # state -> {"flow": Flow, "redirect_uri": str, "ts": float, "manual": bool}
 
 
 class _AccPaused(Exception):
@@ -129,8 +165,7 @@ def load_json(env, fname):
     v = os.environ.get(env)
     if v:
         return json.loads(v)
-    here = os.path.dirname(os.path.abspath(__file__))
-    for p in (fname, os.path.join(here, fname), os.path.join("/etc/secrets", fname)):
+    for p in (fname, os.path.join(HERE, fname), os.path.join("/etc/secrets", fname)):
         if os.path.exists(p):
             with open(p, encoding="utf-8") as f:
                 return json.load(f)
@@ -152,6 +187,8 @@ S = {
     "scan": {"files": 0, "bytes": 0},
     "plan": {"files": 0, "bytes": 0, "dl_files": 0, "dl_bytes": 0, "up_files": 0, "up_bytes": 0},
     "started_at": 0, "ended_at": 0, "speed": 0, "state_ts": 0, "state_file_id": "",
+    "enc_enabled": False, "enc_pass": "",
+    "drive_ok": True, "drive_expired": False, "drive_email": "", "drive_err": "",
     "dl": None, "ul": None, "next": [],
     "accs": {}, "log": collections.deque(maxlen=300), "hist": collections.deque(maxlen=120),
     "stop": False, "failed": False,
@@ -183,6 +220,318 @@ def fmt(n):
 
 def is_dead(e):
     return type(e).__name__ in DEAD
+
+
+# ------------------------------------------------------------------ Google Drive OAuth & Token management (merged get_token)
+def is_token_error(e):
+    msg = str(e).lower()
+    name = type(e).__name__.lower()
+    return (
+        "refresherror" in name
+        or "invalid_grant" in msg
+        or "token has been expired" in msg
+        or "token has been revoked" in msg
+        or "unauthorized_client" in msg
+        or "token.json nahi mila" in msg
+        or "refresh_token" in msg
+        or "invalid_client" in msg
+    )
+
+
+def load_token_dict():
+    """Live in-memory token, phir DATA_DIR/token.json, phir TOKEN_JSON env, phir token.json files."""
+    if _LIVE_TOKEN:
+        return dict(_LIVE_TOKEN)
+    data_tok = os.path.join(DATA_DIR, "token.json")
+    if os.path.exists(data_tok):
+        try:
+            with open(data_tok, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    v = os.environ.get("TOKEN_JSON")
+    if v:
+        return json.loads(v)
+    for p in ("token.json", os.path.join(HERE, "token.json"), os.path.join("/etc/secrets", "token.json")):
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+    raise RuntimeError("TOKEN_JSON ya token.json nahi mila — Google Drive login karo")
+
+
+def update_env_token(token_json_str):
+    """Env file (.env / *.env) me TOKEN_JSON line replace karta hai (backup .bak ke saath)."""
+    target = None
+    for f in env_files():
+        try:
+            for line in open(f, encoding="utf-8-sig"):
+                if line.strip().startswith("TOKEN_JSON="):
+                    target = f
+                    break
+        except OSError:
+            continue
+        if target:
+            break
+    if not target:
+        fs = env_files()
+        if not fs:
+            return None
+        target = fs[0]
+    try:
+        shutil.copy2(target, target + ".bak")
+        lines = open(target, encoding="utf-8-sig").read().splitlines()
+        new_line = "TOKEN_JSON='" + token_json_str + "'"
+        done = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith("TOKEN_JSON="):
+                lines[i] = new_line
+                done = True
+                break
+        if not done:
+            lines.append(new_line)
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        return target
+    except OSError:
+        return None
+
+
+def save_token_dict(out):
+    """Naya token memory, env, DATA_DIR/token.json, HERE/token.json aur .env file me save karta hai."""
+    global _LIVE_TOKEN, _CACHED_CREDS
+    clean = {k: out.get(k) for k in ("token", "refresh_token", "token_uri", "client_id", "client_secret", "scopes")}
+    clean["token_uri"] = clean.get("token_uri") or "https://oauth2.googleapis.com/token"
+    clean["scopes"] = clean.get("scopes") or DRIVE_SCOPES
+    if not clean.get("refresh_token"):
+        raise RuntimeError("refresh_token nahi mila. https://myaccount.google.com/permissions se purani access hata kar dobara login karo.")
+    compact = json.dumps(clean, separators=(",", ":"))
+    with TOKEN_LOCK:
+        _LIVE_TOKEN = clean
+        _CACHED_CREDS = None
+        os.environ["TOKEN_JSON"] = compact
+    saved_paths = []
+    for p in (os.path.join(HERE, "token.json"), os.path.join(DATA_DIR, "token.json")):
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=2)
+            saved_paths.append(p)
+        except OSError:
+            pass
+    env_updated = update_env_token(compact)
+    with FOLDER_LOCK:
+        FOLDER_CACHE.clear()
+    return clean, compact, saved_paths, env_updated
+
+
+def get_client_config():
+    """OAuth client credentials dhoondhta hai:
+    1. DATA_DIR / HERE / /etc/secrets me client_secret*.json ya credentials.json
+    2. GOOGLE_CREDENTIALS_JSON env var
+    3. Fallback: maujooda token.json / TOKEN_JSON ke client_id + client_secret
+    Returns: (cfg_dict, source_label, client_kind)
+    """
+    search_dirs = [DATA_DIR, HERE, "/etc/secrets"]
+    seen = set()
+    for d in search_dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        for pat in ("client_secret*.json", "credentials.json"):
+            for p in sorted(glob.glob(os.path.join(d, pat))):
+                rp = os.path.abspath(p)
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                try:
+                    cfg = json.load(open(p, encoding="utf-8"))
+                    if "web" in cfg or "installed" in cfg:
+                        kind = "web" if "web" in cfg else "installed"
+                        return cfg, os.path.basename(p), kind
+                except Exception:
+                    continue
+    v = os.environ.get("GOOGLE_CREDENTIALS_JSON") or read_env_value("GOOGLE_CREDENTIALS_JSON")
+    if v:
+        cfg = json.loads(v)
+        kind = "web" if "web" in cfg else "installed"
+        return cfg, "GOOGLE_CREDENTIALS_JSON", kind
+    try:
+        t = load_token_dict()
+        if t.get("client_id") and t.get("client_secret"):
+            cfg = {
+                "installed": {
+                    "client_id": t["client_id"],
+                    "client_secret": t["client_secret"],
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": t.get("token_uri") or "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
+            }
+            return cfg, "existing token.json (client_id/secret)", "installed"
+    except Exception:
+        pass
+    raise RuntimeError("OAuth credentials nahi mile. Google Cloud se client_secret.json download karke folder me rakho ya UI me upload karo.")
+
+
+def get_drive_creds():
+    """Valid Google Drive Credentials return karta hai; expire hone par S['drive_expired']=True set karta hai."""
+    global _CACHED_CREDS
+    with TOKEN_LOCK:
+        if _CACHED_CREDS is not None and _CACHED_CREDS.valid:
+            return _CACHED_CREDS
+    try:
+        t = load_token_dict()
+        creds = Credentials(
+            token=t.get("token"),
+            refresh_token=t.get("refresh_token"),
+            token_uri=t.get("token_uri") or "https://oauth2.googleapis.com/token",
+            client_id=t.get("client_id"),
+            client_secret=t.get("client_secret"),
+            scopes=t.get("scopes") or DRIVE_SCOPES,
+        )
+        if not creds.valid:
+            creds.refresh(Request())
+        with TOKEN_LOCK:
+            _CACHED_CREDS = creds
+            if _LIVE_TOKEN is not None:
+                _LIVE_TOKEN["token"] = creds.token
+        S["drive_ok"] = True
+        S["drive_expired"] = False
+        S["drive_err"] = ""
+        return creds
+    except Exception as e:
+        if is_token_error(e):
+            S["drive_ok"] = False
+            S["drive_expired"] = True
+            S["drive_err"] = str(e)[:220]
+        raise
+
+
+def verify_drive_connection_sync():
+    """Drive token check karke user email aur status update karta hai."""
+    try:
+        em = drive_service().about().get(fields="user(emailAddress)").execute()["user"]["emailAddress"]
+        S["drive_ok"] = True
+        S["drive_expired"] = False
+        S["drive_email"] = em
+        S["drive_err"] = ""
+        return True, em, ""
+    except Exception as e:
+        err = str(e)[:220]
+        S["drive_ok"] = False
+        S["drive_expired"] = is_token_error(e) or True
+        S["drive_err"] = err
+        return False, "", err
+
+
+def _cleanup_oauth_flows():
+    now = time.time()
+    for st in [k for k, v in OAUTH_FLOWS.items() if now - v.get("ts", 0) > 900]:
+        OAUTH_FLOWS.pop(st, None)
+
+
+def pick_redirect_uri(req, cfg, kind, manual=False):
+    """Request ke hisaab se best OAuth redirect URI choose karta hai."""
+    if manual:
+        return f"http://localhost:{PORT}/oauth/callback"
+    env_uri = (os.environ.get("OAUTH_REDIRECT_URI") or "").strip()
+    if env_uri:
+        return env_uri
+    proto = req.headers.get("X-Forwarded-Proto", req.scheme).split(",")[0].strip()
+    host = req.headers.get("X-Forwarded-Host", req.host).split(",")[0].strip()
+    origin = f"{proto}://{host}"
+    if kind == "web":
+        uris = cfg.get("web", {}).get("redirect_uris") or []
+        # Pehle exact /oauth/callback match dhoondho, phir koi bhi same-origin URI (jaise http://localhost:8080/)
+        for u in uris:
+            if u.rstrip("/") == f"{origin}/oauth/callback":
+                return u
+        for u in uris:
+            if u.startswith(origin):
+                return u
+    return f"{origin}/oauth/callback"
+
+
+def build_oauth_url(req, manual=False, custom_redirect=""):
+    _cleanup_oauth_flows()
+    cfg, src, kind = get_client_config()
+    redirect_uri = (custom_redirect or "").strip() or pick_redirect_uri(req, cfg, kind, manual=manual)
+    flow = Flow.from_client_config(cfg, scopes=DRIVE_SCOPES, redirect_uri=redirect_uri)
+    state = secrets.token_urlsafe(24)
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+        state=state,
+    )
+    OAUTH_FLOWS[state] = {
+        "flow": flow,
+        "redirect_uri": redirect_uri,
+        "ts": time.time(),
+        "manual": bool(manual),
+    }
+    return auth_url, state, redirect_uri, src, kind
+
+
+def exchange_oauth_code_sync(code, state="", redirect_uri=""):
+    """Authorization code ko Google se exchange karke token save karta hai."""
+    _cleanup_oauth_flows()
+    code = (code or "").strip()
+    if not code:
+        raise RuntimeError("Authorization code khaali hai")
+    entry = OAUTH_FLOWS.pop(state, None) if state else None
+    if entry is None and OAUTH_FLOWS:
+        # Agar user ne sirf raw code paste kiya (bina state ke), sabse recent flow use karo
+        latest_st = max(OAUTH_FLOWS, key=lambda k: OAUTH_FLOWS[k]["ts"])
+        entry = OAUTH_FLOWS.pop(latest_st)
+    if entry is not None:
+        flow = entry["flow"]
+        r_uri = entry["redirect_uri"]
+    else:
+        cfg, _, _ = get_client_config()
+        r_uri = (redirect_uri or "").strip() or f"http://localhost:{PORT}/oauth/callback"
+        flow = Flow.from_client_config(cfg, scopes=DRIVE_SCOPES, redirect_uri=r_uri)
+    if r_uri.startswith("http://"):
+        os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+    d = json.loads(creds.to_json())
+    clean, compact, saved_paths, env_updated = save_token_dict(d)
+    ok, email, err = verify_drive_connection_sync()
+    if not ok:
+        raise RuntimeError(f"Token save hua par Drive verify fail: {err}")
+    return clean, compact, email, saved_paths, env_updated
+
+
+def run_cli_get_token(port=None):
+    """Terminal se `python tg2gd.py --get-token [port]` chalane par seedha browser login se token banata hai."""
+    use_port = int(port) if port else PORT
+    cfg, src, kind = get_client_config()
+    print(f"[info] credentials source: {src} (type: {kind})", flush=True)
+    if kind == "web":
+        print(
+            f"\n[dhyan] Aapka client type 'Web application' hai. Google Cloud Console me is client ke\n"
+            f"        'Authorized redirect URIs' me ye add hona chahiye:\n"
+            f"        http://localhost:{use_port}/\n"
+            f"        (aakhir ka / bhi ho, aur http hona chahiye. Console me jo likha ho wahi exact match hona chahiye.)\n"
+            f"        (Ya 'Desktop app' type ka naya OAuth client bana kar uski client_secret.json yahan rakho.)\n",
+            flush=True,
+        )
+    flow = InstalledAppFlow.from_client_config(cfg, DRIVE_SCOPES)
+    creds = flow.run_local_server(
+        port=use_port,
+        access_type="offline",
+        prompt="consent",
+        open_browser=True,
+        authorization_prompt_message="Browser me login karo: {url}\n",
+        success_message="Done! Ye tab band kar sakte ho.",
+    )
+    if not creds.refresh_token:
+        raise SystemExit("refresh_token nahi mila. https://myaccount.google.com/permissions se purani access hata kar dobara chalao.")
+    d = json.loads(creds.to_json())
+    _, _, saved_paths, env_updated = save_token_dict(d)
+    print(f"\n[ok] token.json ban gaya ({', '.join(saved_paths)})", flush=True)
+    if env_updated:
+        print(f"[ok] {os.path.basename(env_updated)} me TOKEN_JSON update ho gaya (backup: {os.path.basename(env_updated)}.bak)", flush=True)
+    print("\nAb python tg2gd.py chalao.", flush=True)
 
 
 async def flood_safe(fn, who="", tries=10):
@@ -219,6 +568,8 @@ def state_dict():
         "queue": S["queue"],
         "done_keys": S["done_keys"],
         "csv_staged": S["csv_staged"],
+        "enc_enabled": S["enc_enabled"],
+        "enc_pass": S["enc_pass"],
     }
 
 
@@ -280,6 +631,8 @@ def apply_state_dict(d):
         total_bytes=int(d.get("total_bytes") or 0),
         queue=d.get("queue") if isinstance(d.get("queue"), list) else [],
         done_keys=[str(x) for x in (d.get("done_keys") or [])],
+        enc_enabled=bool(d.get("enc_enabled", False)),
+        enc_pass=str(d.get("enc_pass") or ""),
     )
     if isinstance(d.get("csv_opts"), dict):
         co = d["csv_opts"]
@@ -418,11 +771,9 @@ def parse_msg_link(url):
     if not u:
         return None
     u = u.split("?", 1)[0].split("#", 1)[0].rstrip("/")
-    # private channel: t.me/c/<chat_id>/<msg_id> or t.me/c/<chat_id>/<topic_id>/<msg_id>
     m = re.search(r"(?:t\.me|telegram\.me)/c/(\d+)/(?:\d+/)?(\d+)$", u, re.I)
     if m:
         return f"-100{m.group(1)}", int(m.group(2))
-    # public channel: t.me/(s/)?<username>/<msg_id> or /<topic_id>/<msg_id>
     m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z][A-Za-z0-9_]{3,})/(?:\d+/)?(\d+)$", u, re.I)
     if m:
         uname = m.group(1)
@@ -461,7 +812,6 @@ def parse_csv_text(text, filename="upload.csv"):
     col_old_title = find_col(["OLD TITLE", "old_title"])
     col_path = find_col(["PATH", "path", "folder_path", "dir", "folder"])
     col_size = find_col(["size_bytes", "size", "bytes"])
-    # CSV me 'type' (pdf/video) aur 'TYPE' (LECTURES/NOTES/DPP) dono ho sakte hain
     col_cat = find_col(["TYPE", "category", "cat"])
     if col_cat is None:
         col_cat = find_col(["type"])
@@ -780,7 +1130,6 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
     eid = ent_id if ent_id is not None else S.get("_ent_id")
     ch_spec = channel_spec if channel_spec is not None else S["channel"]
 
-    # photo: chhoti file, kisi bhi unpaused account se (agar sab paused hon to wait)
     if msg.photo and not msg.document:
         while not S["stop"]:
             aid, cl = pick_unpaused_client()
@@ -806,7 +1155,7 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
         S["accs"][aid]["bytes"] += real
         return real
 
-    if PRIMARY_SMALL and size <= SEG:    # chhoti file: sirf primary se (default band, sab barabar)
+    if PRIMARY_SMALL and size <= SEG:
         pa = S["accs"][PRIMARY_AID]
         for attempt in range(3):
             if pa["status"] != "ok" or pa["paused"]:
@@ -850,7 +1199,7 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
                 pa["bytes"] -= base[0]
                 dl["done"] -= base[0]
                 if isinstance(e, FLOOD):
-                    flood_mark(pa, e.seconds)       # baaki accounts wali raah se aage badho
+                    flood_mark(pa, e.seconds)
                     break
                 if is_dead(e):
                     acc_dead(pa, e)
@@ -903,7 +1252,7 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
             return r
 
         while remaining[0] > 0 and not S["stop"] and not fatal and a["status"] != "dead":
-            if a["status"] == "flood" or a["paused"]:     # flood ya pause me kuch mat uthao
+            if a["status"] == "flood" or a["paused"]:
                 await asyncio.sleep(0.5)
                 continue
             if m is None:
@@ -1022,12 +1371,7 @@ async def download_msg(msg, size, path, ent_id=None, channel_spec=None):
 
 # ------------------------------------------------------------------ drive service & folder API
 def drive_service():
-    t = load_json("TOKEN_JSON", "token.json")
-    creds = Credentials(
-        token=t.get("token"), refresh_token=t["refresh_token"], token_uri=t["token_uri"],
-        client_id=t["client_id"], client_secret=t["client_secret"], scopes=t.get("scopes"))
-    if not creds.valid:
-        creds.refresh(Request())
+    creds = get_drive_creds()
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -1162,12 +1506,7 @@ def _next_pos(r):
 
 def upload_blocking(path, name, folder, ul):
     from google.auth.transport.requests import AuthorizedSession
-    t = load_json("TOKEN_JSON", "token.json")
-    creds = Credentials(
-        token=t.get("token"), refresh_token=t["refresh_token"], token_uri=t["token_uri"],
-        client_id=t["client_id"], client_secret=t["client_secret"], scopes=t.get("scopes"))
-    if not creds.valid:
-        creds.refresh(Request())
+    creds = get_drive_creds()
     sess = AuthorizedSession(creds)
     total = os.path.getsize(path)
     meta = {"name": name}
@@ -1177,6 +1516,10 @@ def upload_blocking(path, name, folder, ul):
                   params={"uploadType": "resumable", "supportsAllDrives": "true", "fields": "id,name"},
                   json=meta, headers={"X-Upload-Content-Length": str(total)}, timeout=60)
     if r.status_code >= 400:
+        if r.status_code == 401:
+            S["drive_ok"] = False
+            S["drive_expired"] = True
+            S["drive_err"] = f"drive init 401: {r.text[:160]}"
         raise RuntimeError(f"drive init {r.status_code}: {r.text[:200]}")
     loc = r.headers["Location"]
     ul["done"] = 0
@@ -1200,6 +1543,11 @@ def upload_blocking(path, name, folder, ul):
             except Exception as e:
                 if S["stop"]:
                     return None
+                if is_token_error(e):
+                    S["drive_ok"] = False
+                    S["drive_expired"] = True
+                    S["drive_err"] = str(e)[:200]
+                    raise
                 err = str(e)[:120]
             if code in (200, 201):
                 ul["done"] = total
@@ -1223,7 +1571,65 @@ def upload_blocking(path, name, folder, ul):
                 except Exception:
                     pass
                 continue
+            if code == 401:
+                S["drive_ok"] = False
+                S["drive_expired"] = True
+                S["drive_err"] = f"drive upload 401: {r.text[:160]}"
             raise RuntimeError(f"drive upload {code}: {r.text[:200]}")
+
+
+def find_7z_bin():
+    """System me native 7z binary dhoondhta hai (Windows + Linux)."""
+    for cand in ("7z", "7zz", "7za", r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
+        p = shutil.which(cand) if not os.path.isabs(cand) else (cand if os.path.exists(cand) else None)
+        if p:
+            return p
+    return None
+
+
+def encrypt_to_7z_sync(src_path, orig_name, password):
+    """File ko 7z Store Mode (no compression) + AES-256 password + header encryption me pack karta hai.
+    Hybrid: pehle native 7z CLI (-mx=0 -mhe=on), na milne par py7zr (FILTER_COPY)."""
+    out_path = src_path + ".7z"
+    if os.path.exists(out_path):
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
+    # Archive ke andar ka naam Windows/Linux safe rakho taaki extract karte waqt error na aaye
+    inner_name = safe_name(orig_name) or "file"
+    seven_z = find_7z_bin()
+    if seven_z:
+        tmp_dir = src_path + "_enc_tmp"
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        os.makedirs(tmp_dir, exist_ok=True)
+        link_path = os.path.join(tmp_dir, inner_name)
+        moved = False
+        try:
+            try:
+                os.link(src_path, link_path)
+            except OSError:
+                shutil.move(src_path, link_path)
+                moved = True
+            cmd = [seven_z, "a", "-t7z", "-mx=0", "-mhe=on", "-y", f"-p{password}", out_path, link_path]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"7z CLI error: {(r.stderr or r.stdout)[:180]}")
+        finally:
+            if moved and not os.path.exists(src_path) and os.path.exists(link_path):
+                try:
+                    shutil.move(link_path, src_path)
+                except OSError:
+                    pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        import py7zr
+        filters = [{"id": py7zr.FILTER_COPY}]
+        with py7zr.SevenZipFile(out_path, "w", password=password, filters=filters) as zf:
+            zf.set_encrypted_header(True)
+            zf.write(src_path, arcname=inner_name)
+    up_name = orig_name if orig_name.lower().endswith(".7z") else (orig_name + ".7z")
+    return out_path, up_name, os.path.getsize(out_path)
 
 
 async def upload_file(msg_id, path, name, size, folder_parts=None, index_id=""):
@@ -1265,9 +1671,7 @@ async def scan_channel(ent, min_id):
 
 
 async def scan_queue_list(queue):
-    """File list / CSV entries ko scan karke downloadable items banata hai.
-    Returns: list of dicts {"ch_spec", "ent", "ent_id", "msg_id", "size", "key", "custom_name", "folder_parts", "index_id"}
-    """
+    """File list / CSV entries ko scan karke downloadable items banata hai."""
     S["phase"] = "scanning"
     S["scan"] = {"files": 0, "bytes": 0}
     ents = {}
@@ -1305,7 +1709,7 @@ async def scan_queue_list(queue):
 
     done_set = set(S["done_keys"])
     seen = set()
-    wanted_runs = []   # list of (ch_spec, [(msg_id, custom_name, folder_parts, index_id), ...])
+    wanted_runs = []
     use_path = S["csv_opts"].get("use_path", True) if S["mode"] == "csv" else False
     use_title = S["csv_opts"].get("use_title", True) if S["mode"] == "csv" else False
 
@@ -1371,11 +1775,14 @@ async def run_once():
             if c.get("ent") is not None:
                 keep_names.add(f"{c['ent']}_{c['id']}.part")
         for fn in os.listdir(DATA_DIR):
-            if fn.endswith(".part") and fn not in keep_names:
+            full_p = os.path.join(DATA_DIR, fn)
+            if (fn.endswith(".part") and fn not in keep_names) or fn.endswith(".part.7z"):
                 try:
-                    os.remove(os.path.join(DATA_DIR, fn))
+                    os.remove(full_p)
                 except OSError:
                     pass
+            elif fn.endswith("_enc_tmp") and os.path.isdir(full_p):
+                shutil.rmtree(full_p, ignore_errors=True)
 
         if S["mode"] in ("list", "csv"):
             if not S["queue"]:
@@ -1424,13 +1831,29 @@ async def run_once():
                 if it is None:
                     return
                 msg_id, path, name, size, key, folder_parts, index_id = it
+                enc_path = None
                 try:
-                    ok = await upload_file(msg_id, path, name, size, folder_parts=folder_parts, index_id=index_id)
-                    if ok:
+                    up_path, up_name, up_size = path, name, size
+                    if S["enc_enabled"] and S["enc_pass"]:
+                        S["phase"] = "encrypting (7z)"
+                        log(f"7z encrypt (store): {name}")
+                        enc_path, up_name, up_size = await asyncio.to_thread(
+                            encrypt_to_7z_sync, path, name, S["enc_pass"]
+                        )
+                        up_path = enc_path
                         try:
                             os.remove(path)
                         except OSError:
                             pass
+                        S["phase"] = "transferring"
+                    ok = await upload_file(msg_id, up_path, up_name, up_size, folder_parts=folder_parts, index_id=index_id)
+                    if ok:
+                        for p_del in (up_path, path):
+                            if p_del and os.path.exists(p_del):
+                                try:
+                                    os.remove(p_del)
+                                except OSError:
+                                    pass
                         if S["mode"] in ("list", "csv"):
                             if key not in S["done_keys"]:
                                 S["done_keys"].append(key)
@@ -1439,7 +1862,7 @@ async def run_once():
                         else:
                             S["last_done"] = max(S["last_done"], msg_id)
                         S["done_count"] += 1
-                        S["total_bytes"] += size
+                        S["total_bytes"] += up_size
                         S["plan"]["up_files"] += 1
                         S["plan"]["up_bytes"] += size
                         cur = cur_state["cur"]
@@ -1447,6 +1870,11 @@ async def run_once():
                             cur_state["cur"] = None
                         await save_state(True)
                 except Exception as e:
+                    if enc_path and os.path.exists(enc_path):
+                        try:
+                            os.remove(enc_path)
+                        except OSError:
+                            pass
                     log(f"UPLOAD FAIL {name}: {e}", "err")
                     S["failed"] = True
                     S["stop"] = True
@@ -1534,6 +1962,9 @@ async def run_job():
         if S["status"] in ("finished", "stopped"):
             if S["status"] == "finished":
                 log("sab files ho gayi", "ok")
+            return
+        if S["drive_expired"]:
+            log("Google Drive token expire/invalid ho gaya — UI se 'Login Google Drive' karke wapis Start dabao", "err")
             return
         bad = 0 if S["done_count"] > before else bad + 1
         if bad >= 5:
@@ -1625,7 +2056,14 @@ def status_json():
         "state_ago": (now - S["state_ts"]) if S["state_ts"] else -1,
         "state_file": STATE_FILE_NAME,
         "state_file_id": S["state_file_id"],
+        "drive_ok": S["drive_ok"],
+        "drive_expired": S["drive_expired"],
+        "drive_email": S["drive_email"],
+        "drive_err": S["drive_err"],
         "cryptg": HAS_CRYPTG,
+        "enc_enabled": S["enc_enabled"],
+        "enc_pass": S["enc_pass"],
+        "enc_engine": "7z CLI" if find_7z_bin() else "py7zr",
     }
 
 
@@ -1658,6 +2096,11 @@ h1{font-size:17px;margin:0;font-weight:700;letter-spacing:.2px}h1 span{color:var
 #ph{color:var(--m);font-size:11px;flex:none}
 .offline{display:none;position:sticky;top:0;z-index:25;background:var(--er);color:#fff;text-align:center;font-size:12px;font-weight:600;padding:6px;margin:0 -12px}
 .offline.show{display:block}
+.drive-warn{display:none;background:#2f1419;border:1px solid #6e2228;color:#ffd0d5;border-radius:12px;padding:11px 14px;margin-bottom:12px;align-items:center;gap:10px;flex-wrap:wrap}
+.drive-warn.show{display:flex}
+.drive-warn .dw-txt{flex:1;min-width:180px;font-size:12.5px;line-height:1.4}
+.drive-warn .dw-txt b{color:#fff;display:block;font-size:13px}
+.drive-warn button{flex:none;padding:8px 13px;font-size:12.5px}
 .tabpane{display:none}.tabpane.on{display:block}
 .card{background:var(--card);border:1px solid var(--b);border-radius:14px;padding:14px 16px;margin-bottom:12px;min-width:0}
 .card h3{white-space:nowrap;gap:10px;margin:0 0 10px;font-size:11px;font-weight:600;color:var(--m);text-transform:uppercase;letter-spacing:.8px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}
@@ -1790,6 +2233,13 @@ nav.tabs button:active{transform:none;opacity:.7}
 .dm-foot{display:flex;gap:8px;padding-top:4px;border-top:1px solid var(--b)}
 .dm-foot button{flex:1;padding:11px 12px;font-size:13.5px}
 .dm-foot button.sec{flex:0 0 auto}
+.auth-body{overflow:auto;display:flex;flex-direction:column;gap:10px}
+.auth-box{background:var(--card2);border:1px solid var(--b);border-radius:11px;padding:11px 12px}
+.auth-box h4{margin:0 0 6px;font-size:11.5px;color:var(--m);text-transform:uppercase;letter-spacing:.6px;display:flex;align-items:center;gap:6px}
+.auth-box p{margin:0 0 8px;font-size:12.5px;color:var(--m);line-height:1.45}
+.auth-uri{background:#080b12;border:1px solid var(--b);border-radius:7px;padding:6px 9px;font:11.5px/1.4 ui-monospace,Consolas,monospace;color:#9cc7ff;word-break:break-all;margin:6px 0 8px}
+.auth-status{display:flex;align-items:center;gap:8px;padding:8px 11px;border-radius:9px;font-size:12.5px;background:var(--card2);border:1px solid var(--b)}
+.auth-status.ok{border-color:#1d5c38;color:var(--ok)}.auth-status.bad{border-color:#6e2228;color:var(--er)}
 .hide{display:none!important}
 .ico{width:15px;height:15px;display:inline-block;flex:none;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .ico-sm{width:13px;height:13px}.ico-lg{width:18px;height:18px}
@@ -1834,9 +2284,58 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
   </div>
 </div></div>
 
+<div id=authModal class=modal-bg onclick="if(event.target===this)closeAuthModal()">
+<div class="modal drive-modal">
+  <div class=dm-head><h2><svg class="ico" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg> Google Drive Token / Login</h2><button class=dm-close onclick=closeAuthModal() aria-label="Close"><svg class="ico ico-sm" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></div>
+  <div id=am_status class=auth-status>Checking status…</div>
+  <div class=dm-scopes>
+    <button id=am_t_auto class=on onclick="amTab('auto')">Browser Login</button>
+    <button id=am_t_manual onclick="amTab('manual')">Manual Code</button>
+    <button id=am_t_paste onclick="amTab('paste')">Paste Token</button>
+  </div>
+  <div class=auth-body>
+    <div id=am_p_auto class=auth-box>
+      <h4><svg class="ico ico-sm" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> One-Click Google Login</h4>
+      <p>Google account se login karke naya <b>token.json</b> + <b>.env</b> automatically update karo. Web client use kar rahe ho to Google Cloud Console me ye Redirect URI added honi chahiye:</p>
+      <div id=am_ruri class=auth-uri>Loading…</div>
+      <div id=am_csrc style="font-size:11.5px;color:var(--m);margin-bottom:8px"></div>
+      <div class=btns>
+        <button id=am_btn_login class=okbtn onclick=amStartLogin()><svg class="ico" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> Login with Google</button>
+        <button class=sec onclick="copyTokenJson()"><svg class="ico" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy TOKEN_JSON</button>
+      </div>
+    </div>
+
+    <div id=am_p_manual class="auth-box hide">
+      <h4><svg class="ico ico-sm" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg> Manual Redirect / Code (Render + Desktop Client)</h4>
+      <p>Agar app Render par hai aur aapke paas Desktop <b>client_secret.json</b> hai: pehle Google Login kholo, Allow karo, phir browser address bar ka poora <b>http://localhost:...</b> URL (ya sirf <b>code</b>) yahan paste karo.</p>
+      <button type=button class="sec sm" style="width:100%;margin-bottom:8px" onclick=amOpenManual()><svg class="ico ico-sm" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg> 1. Open Google Login in New Tab</button>
+      <label>2. Paste Redirect URL ya Auth Code</label>
+      <input id=am_code placeholder="http://localhost:8080/oauth/callback?state=...&code=4/0A..." autocomplete=off>
+      <div style="margin-top:8px"><button id=am_btn_ex class=okbtn style="width:100%" onclick=amSubmitCode()><svg class="ico" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg> Verify &amp; Save Token</button></div>
+    </div>
+
+    <div id=am_p_paste class="auth-box hide">
+      <h4><svg class="ico ico-sm" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg> Direct Paste token.json / Upload client_secret.json</h4>
+      <p>Agar PC par <b>python tg2gd.py --get-token</b> se token banaya hai to uska JSON seedha yahan paste karke bina restart ke live apply karo.</p>
+      <textarea id=am_tok_txt style="min-height:95px;font:12px/1.45 ui-monospace,Consolas,monospace" placeholder='{"token":"...","refresh_token":"...","client_id":"...","client_secret":"..."}'></textarea>
+      <div class=btns style="margin-top:8px">
+        <button class=okbtn onclick=amPasteToken()><svg class="ico" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg> Apply Token Live</button>
+        <input type=file id=am_cred_file accept=".json,application/json" class=hide onchange="amUploadCreds(this.files[0])">
+        <button type=button class=sec onclick="$('am_cred_file').click()"><svg class="ico" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> Upload client_secret.json</button>
+      </div>
+    </div>
+  </div>
+</div></div>
+
 <div class=w>
 <header><h1>TG <span>→</span> Drive</h1><span id=st class=pill>idle</span><span id=ph></span>
 <div class=sub><div id=ch></div><div id=sv></div></div></header>
+
+<div id=drive_warn class=drive-warn>
+  <svg class="ico ico-lg" style="color:var(--er)" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+  <div class=dw-txt><b>Google Drive Token Expired / Invalid</b><span id=dw_err>Dobara login karke naya token generate karo.</span></div>
+  <button type=button class=okbtn onclick=openAuthModal()><svg class="ico" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg> Login Google Drive</button>
+</div>
 
 <div id=pane-control class="tabpane on">
 <div class=card>
@@ -1918,6 +2417,21 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
     </div>
   </div>
 
+  <!-- 7z Store Mode Encryption -->
+  <div class=qbox style="margin-bottom:10px">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+      <label class=fresh style="margin:0;color:var(--t);font-weight:600">
+        <input type=checkbox id=in_enc onchange="toggleEncBox();persist()">
+        <svg class="ico ico-sm" style="color:var(--ac)" viewBox="0 0 24 24"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        Auto 7z Encrypt (Store Mode / No Compression)
+      </label>
+      <span id=enc_eng_lbl style="font-size:11px;color:var(--m)">Per-file .7z · Header Lock</span>
+    </div>
+    <div id=enc_box class=hide style="margin-top:8px">
+      <input id=in_enc_pass type=text placeholder="7z Password daalo (e.g. 1234)" oninput=persist() autocomplete=off autocorrect=off autocapitalize=off>
+    </div>
+  </div>
+
   <div class=ctl>
     <div class=btns><label class=fresh><input type=checkbox id=in_fr> Fresh (cache / progress clear)</label></div>
     <div class=btns><button id=b_go onclick=go()><svg class="ico" viewBox="0 0 24 24"><polygon points="6 4 20 12 6 20 6 4" fill="currentColor" stroke="none"/></svg> Start / Resume</button><button id=b_st class=stop onclick=askStop()><svg class="ico" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor" stroke="none"/></svg> Stop</button></div>
@@ -1972,6 +2486,19 @@ nav.tabs{display:none}body{padding-bottom:40px}.tabpane{display:block!important}
 <div id=pane-info class=tabpane>
 <div class=card><h3><span>Overall progress</span><span id=opct2 style="color:var(--t)">0%</span></h3>
 <div class="bar big g"><i id=ob2></i></div><div class=row><span id=o1b></span><span id=o2b></span></div></div>
+
+<div class=card>
+  <h3>
+    <span><svg class="ico" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg> Google Drive Auth</span>
+    <span class=ac-head-r>
+      <button type=button class="sec xs" onclick=copyTokenJson()><svg class="ico ico-sm" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> Copy TOKEN_JSON</button>
+      <button type=button class="okbtn xs" onclick=openAuthModal()><svg class="ico ico-sm" viewBox="0 0 24 24"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg> Re-login Drive</button>
+    </span>
+  </h3>
+  <div class=row><span>Drive status</span><span id=info_drive>Checking…</span></div>
+  <div class=row><span>Account</span><span id=info_drive_em>—</span></div>
+</div>
+
 <div class=card><h3><span>Lifetime</span></h3>
 <div class=row><span>Total files</span><span id=info_files>0</span></div>
 <div class=row><span>Total data</span><span id=info_bytes>0</span></div>
@@ -2014,7 +2541,109 @@ if(navigator.vibrate)navigator.vibrate(8)}
 
 // -- toasts --
 function toast(msg,kind){const d=document.createElement('div');d.className='toast '+(kind||'');d.textContent=msg;$('toasts').appendChild(d);
-setTimeout(()=>{d.style.transition='opacity .4s';d.style.opacity=0;setTimeout(()=>d.remove(),400)},2600)}
+setTimeout(()=>{d.style.transition='opacity .4s';d.style.opacity=0;setTimeout(()=>d.remove(),400)},2800)}
+
+// -- Google Drive Auth Modal --
+function amTab(t){
+ ['auto','manual','paste'].forEach(k=>{
+  $('am_t_'+k).classList.toggle('on',k===t);
+  $('am_p_'+k).classList.toggle('hide',k!==t);
+ });
+}
+async function openAuthModal(){
+ $('authModal').classList.add('show');
+ amTab('auto');
+ $('am_status').className='auth-status';
+ $('am_status').textContent='Checking Google Drive auth status…';
+ try{
+  const r=await fetch('/api/drive/auth/status');
+  const j=await r.json();
+  if(j.drive_ok){
+   $('am_status').className='auth-status ok';
+   $('am_status').textContent='Connected: '+(j.email||'Google Drive OK');
+  }else{
+   $('am_status').className='auth-status bad';
+   $('am_status').textContent='Not connected: '+(j.error||'Token expired / missing');
+  }
+  $('am_ruri').textContent=j.redirect_uri||location.origin+'/oauth/callback';
+  $('am_csrc').textContent=j.has_creds?('Credentials: '+j.cred_source+' ('+j.cred_kind+')'):'Warning: client_secret.json nahi mila — Paste Token tab se upload karo';
+  $('am_btn_login').disabled=!j.has_creds;
+ }catch(e){
+  $('am_status').className='auth-status bad';
+  $('am_status').textContent='Status load fail ho gaya';
+ }
+}
+function closeAuthModal(){$('authModal').classList.remove('show')}
+function amStartLogin(){location.href='/oauth/start'}
+async function amOpenManual(){
+ try{
+  const r=await fetch('/api/drive/auth/url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({manual:true})});
+  const j=await r.json();
+  if(!j.ok){toast(j.error||'Auth URL fail','err');return}
+  window.open(j.url,'_blank','noopener');
+  toast('Google login naye tab me khul gaya — allow karke URL paste karo','ok');
+ }catch(e){toast('Request fail ho gaya','err')}
+}
+async function amSubmitCode(){
+ const raw=$('am_code').value.trim();
+ if(!raw){toast('Redirect URL ya code paste karo pehle','err');return}
+ $('am_btn_ex').disabled=true;
+ try{
+  const r=await fetch('/api/drive/auth/exchange',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({input:raw})});
+  const j=await r.json();
+  if(j.ok){
+   $('am_code').value='';
+   toast('Google Drive login OK: '+j.email,'ok');
+   openAuthModal();tick();
+  }else toast(j.error||'Token exchange fail','err');
+ }catch(e){toast('Request fail ho gaya','err')}
+ $('am_btn_ex').disabled=false;
+}
+async function amPasteToken(){
+ const text=$('am_tok_txt').value.trim();
+ if(!text){toast('token.json paste karo pehle','err');return}
+ try{
+  const r=await fetch('/api/drive/auth/paste',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+  const j=await r.json();
+  if(j.ok){
+   $('am_tok_txt').value='';
+   toast('Token live apply ho gaya: '+j.email,'ok');
+   openAuthModal();tick();
+  }else toast(j.error||'Invalid token','err');
+ }catch(e){toast('Request fail ho gaya','err')}
+}
+async function amUploadCreds(file){
+ if(!file)return;
+ try{
+  const text=await file.text();
+  const r=await fetch('/api/drive/auth/credentials',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:file.name,text})});
+  const j=await r.json();
+  if(j.ok){toast('Credentials save ho gaye ('+j.kind+')','ok');openAuthModal()}
+  else toast(j.error||'Invalid credentials file','err');
+ }catch(e){toast('Upload fail ho gaya','err')}
+ $('am_cred_file').value='';
+}
+async function copyTokenJson(){
+ try{
+  const r=await fetch('/api/drive/auth/token_str');
+  const j=await r.json();
+  if(!j.ok||!j.token_json){toast(j.error||'Token available nahi hai','err');return}
+  await navigator.clipboard.writeText(j.token_json);
+  toast('TOKEN_JSON copy ho gaya (Render Env me paste kar sakte ho)','ok');
+ }catch(e){toast('Copy nahi ho paya','err')}
+}
+
+// -- check OAuth redirect query banner --
+(function(){
+ const p=new URLSearchParams(location.search);
+ if(p.get('auth')==='ok'){
+  toast('Google Drive login successful! Naya token save ho gaya','ok');
+  history.replaceState(null,'','/');
+ }else if(p.get('auth_err')){
+  toast('Drive login fail: '+p.get('auth_err'),'err');
+  history.replaceState(null,'','/');
+ }
+})();
 
 // -- mode switcher --
 function setMode(m){
@@ -2038,6 +2667,7 @@ function setFolder(id,name){
 }
 function onFolderInput(){folderName='';renderFolderBadge();persist()}
 function clearFolder(){setFolder('','');toast('My Drive (Root) set ho gaya','ok')}
+function toggleEncBox(){$('enc_box').classList.toggle('hide',!$('in_enc').checked)}
 function renderFolderBadge(){
  const v=$('in_fo').value.trim();
  if(folderName){$('fo_bname').textContent=folderName+(v?' ('+v.slice(0,10)+'…)':'');$('fo_badge').classList.remove('hide')}
@@ -2298,18 +2928,23 @@ try{
  if(saved.folder)$('in_fo').value=saved.folder;
  if(saved.folder_name)folderName=saved.folder_name;
  if(Array.isArray(saved.queue))queue=saved.queue;
+ if(saved.enc_enabled){$('in_enc').checked=true;toggleEncBox()}
+ if(saved.enc_pass)$('in_enc_pass').value=saved.enc_pass;
  if(saved.mode)setMode(saved.mode);
  renderFolderBadge();renderQueue();
 }catch(e){}
 function persist(){
  try{localStorage.setItem('tg2gd_last',JSON.stringify({
-  mode:curMode,channel:$('in_ch').value,folder:$('in_fo').value,folder_name:folderName,queue
+  mode:curMode,channel:$('in_ch').value,folder:$('in_fo').value,folder_name:folderName,queue,
+  enc_enabled:$('in_enc').checked,enc_pass:$('in_enc_pass').value
  }))}catch(e){}
 }
 
 async function go(){
  const folder=$('in_fo').value.trim();
- const payload={mode:curMode,folder,folder_name:folderName,fresh:$('in_fr').checked};
+ const enc_enabled=$('in_enc').checked,enc_pass=$('in_enc_pass').value.trim();
+ if(enc_enabled&&!enc_pass){toast('7z Encryption ke liye password daalo','err');return}
+ const payload={mode:curMode,folder,folder_name:folderName,fresh:$('in_fr').checked,enc_enabled,enc_pass};
  if(curMode==='csv'){
   if(!csvInfo||!csvInfo.total){toast('Pehle CSV file upload karo','err');return}
   payload.csv_opts={
@@ -2369,9 +3004,24 @@ if(!filled&&(s.channel||s.folder||(s.queue&&s.queue.length)||s.csv_info)&&!['INP
   }
   renderCsv();
  }
+ if(s.enc_enabled){$('in_enc').checked=true;toggleEncBox()}
+ if(s.enc_pass)$('in_enc_pass').value=s.enc_pass;
  if(s.mode==='list'||s.mode==='csv')setMode(s.mode);
  filled=true;
 }else if(prevLastIdx!==lastIndexId&&csvInfo){renderCsv()}
+// Drive auth banner & Info tab status
+if(s.drive_expired||!s.drive_ok){
+ $('drive_warn').classList.add('show');
+ $('dw_err').textContent=s.drive_err||'Token expire/revoke ho gaya — wapis login karo.';
+ $('info_drive').textContent='Expired / Disconnected';
+ $('info_drive').style.color='var(--er)';
+}else{
+ $('drive_warn').classList.remove('show');
+ $('info_drive').textContent='Connected (OK)';
+ $('info_drive').style.color='var(--ok)';
+}
+$('info_drive_em').textContent=s.drive_email||'—';
+
 const run=s.status=='running';$('st').textContent=s.stopping?'stopping…':s.all_paused&&run?'paused':s.status;$('st').className='pill '+(s.stopping||(s.all_paused&&run)?'stopped':s.status);$('b_go').disabled=run;$('b_st').disabled=!run||s.stopping;
 const scanning=s.phase=='scanning';$('ph').textContent=scanning?('scanning… '+s.scan.files+' files'):(s.phase||'');
 $('ch').textContent=s.channel_title||'';
@@ -2411,6 +3061,7 @@ drawChart(s.hist);
 lastLog=s.log;renderLog();
 $('opct2').textContent=$('opct').textContent;$('ob2').style.width=$('ob').style.width;$('o1b').textContent=$('o1').textContent;$('o2b').textContent=$('o2').textContent;
 $('info_files').textContent=s.done_count;$('info_bytes').textContent=fb(s.total_bytes);$('info_idx').textContent=lastIndexId?('#'+lastIndexId):'—';$('info_cryptg').textContent=s.cryptg?'OK (fast decrypt)':'off (slower)';
+if(s.enc_engine)$('enc_eng_lbl').textContent='Per-file .7z · Header Lock · '+s.enc_engine;
 }
 setInterval(tick,1000);tick();
 window.addEventListener('online',()=>{failStreak=0;$('offlinebar').classList.remove('show');tick()});
@@ -2432,6 +3083,23 @@ def authed(req):
     return req.cookies.get("sid") in SESS
 
 
+async def _reload_drive_state_after_login():
+    """Login ke baad agar startup par Drive state load nahi ho paayi thi to load kar lo."""
+    global STATE_FILE_ID
+    if STATE_FILE_ID:
+        return
+    try:
+        fid, st, _ = await asyncio.wait_for(asyncio.to_thread(drive_load_state_sync), 30)
+        if fid:
+            STATE_FILE_ID = fid
+            S["state_file_id"] = fid
+        if st and S["status"] == "idle":
+            apply_state_dict(st)
+            log(f"Drive state load ho gayi ({STATE_FILE_NAME}): mode={S['mode']}, done={S['done_count']}", "ok")
+    except Exception as e:
+        log(f"post-login state load warn: {e}", "warn")
+
+
 async def h_login(req):
     if req.method == "POST":
         d = await req.post()
@@ -2445,9 +3113,170 @@ async def h_login(req):
 
 
 async def h_index(req):
+    # Support root callback (http://localhost:8080/?state=...&code=...) jaise purane get_token.py me hota tha
+    if req.query.get("code") and req.query.get("state") in OAUTH_FLOWS:
+        return await h_oauth_callback(req)
     if not authed(req):
         raise web.HTTPFound("/login")
     return web.Response(text=HTML, content_type="text/html")
+
+
+async def h_oauth_start(req):
+    if not authed(req):
+        raise web.HTTPFound("/login")
+    try:
+        auth_url, _, redirect_uri, src, kind = build_oauth_url(req, manual=False)
+        log(f"Google Drive OAuth shuru ({src}, {kind}, redirect={redirect_uri})", "ok")
+        raise web.HTTPFound(auth_url)
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        from urllib.parse import quote
+        log(f"OAuth start fail: {e}", "err")
+        raise web.HTTPFound("/?auth_err=" + quote(str(e)[:140]))
+
+
+async def h_oauth_callback(req):
+    from urllib.parse import quote
+    err = req.query.get("error")
+    if err:
+        log(f"Google OAuth cancel/error: {err}", "err")
+        raise web.HTTPFound("/?auth_err=" + quote(err))
+    code = req.query.get("code", "")
+    state = req.query.get("state", "")
+    if not code or state not in OAUTH_FLOWS:
+        if not authed(req):
+            raise web.HTTPFound("/login")
+        raise web.HTTPFound("/?auth_err=" + quote("Invalid ya expired OAuth state — dobara login karo"))
+    try:
+        _, _, email, saved_paths, env_updated = await asyncio.to_thread(exchange_oauth_code_sync, code, state)
+        extra = f", {os.path.basename(env_updated)} updated" if env_updated else ""
+        log(f"Google Drive login OK: {email} (token.json saved{extra})", "ok")
+        await _reload_drive_state_after_login()
+        raise web.HTTPFound("/?auth=ok")
+    except web.HTTPException:
+        raise
+    except Exception as e:
+        log(f"Google OAuth callback fail: {e}", "err")
+        raise web.HTTPFound("/?auth_err=" + quote(str(e)[:160]))
+
+
+async def h_drive_auth_status(req):
+    if not authed(req):
+        return web.Response(status=401)
+    has_creds, cred_src, cred_kind, ruri = False, "", "", ""
+    try:
+        cfg, cred_src, cred_kind = get_client_config()
+        has_creds = True
+        ruri = pick_redirect_uri(req, cfg, cred_kind, manual=False)
+    except Exception:
+        proto = req.headers.get("X-Forwarded-Proto", req.scheme).split(",")[0].strip()
+        host = req.headers.get("X-Forwarded-Host", req.host).split(",")[0].strip()
+        ruri = f"{proto}://{host}/oauth/callback"
+    return web.json_response({
+        "ok": True,
+        "drive_ok": S["drive_ok"] and not S["drive_expired"],
+        "email": S["drive_email"],
+        "error": S["drive_err"],
+        "has_creds": has_creds,
+        "cred_source": cred_src,
+        "cred_kind": cred_kind,
+        "redirect_uri": ruri,
+    })
+
+
+async def h_drive_auth_url(req):
+    if not authed(req):
+        return web.Response(status=401)
+    try:
+        d = await req.json()
+    except Exception:
+        d = {}
+    manual = bool(d.get("manual"))
+    custom_ruri = (d.get("redirect_uri") or "").strip()
+    try:
+        url, state, ruri, src, kind = build_oauth_url(req, manual=manual, custom_redirect=custom_ruri)
+        return web.json_response({"ok": True, "url": url, "state": state, "redirect_uri": ruri, "source": src, "kind": kind})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)[:200]})
+
+
+async def h_drive_auth_exchange(req):
+    if not authed(req):
+        return web.Response(status=401)
+    d = await req.json()
+    raw = (d.get("input") or "").strip()
+    if not raw:
+        return web.json_response({"ok": False, "error": "Redirect URL ya code daalo"})
+    code, state = raw, ""
+    if "code=" in raw:
+        parsed = urlparse(raw if "://" in raw else "http://localhost/?" + raw.lstrip("?"))
+        qs = parse_qs(parsed.query)
+        code = (qs.get("code") or [""])[0]
+        state = (qs.get("state") or [""])[0]
+    try:
+        _, _, email, _, env_updated = await asyncio.to_thread(exchange_oauth_code_sync, code, state)
+        extra = f", {os.path.basename(env_updated)} updated" if env_updated else ""
+        log(f"Google Drive manual login OK: {email} (token.json saved{extra})", "ok")
+        await _reload_drive_state_after_login()
+        return web.json_response({"ok": True, "email": email})
+    except Exception as e:
+        log(f"Google OAuth manual exchange fail: {e}", "err")
+        return web.json_response({"ok": False, "error": str(e)[:200]})
+
+
+async def h_drive_auth_paste(req):
+    if not authed(req):
+        return web.Response(status=401)
+    d = await req.json()
+    text = (d.get("text") or "").strip()
+    try:
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict) or not parsed.get("refresh_token"):
+            return web.json_response({"ok": False, "error": "Valid token.json daalo jisme refresh_token ho"})
+        await asyncio.to_thread(save_token_dict, parsed)
+        ok, email, err = await asyncio.to_thread(verify_drive_connection_sync)
+        if not ok:
+            return web.json_response({"ok": False, "error": f"Token verify fail: {err}"})
+        log(f"Google Drive token manually paste & verify OK: {email}", "ok")
+        await _reload_drive_state_after_login()
+        return web.json_response({"ok": True, "email": email})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)[:200]})
+
+
+async def h_drive_auth_credentials(req):
+    if not authed(req):
+        return web.Response(status=401)
+    d = await req.json()
+    text = (d.get("text") or "").strip()
+    try:
+        cfg = json.loads(text)
+        if not isinstance(cfg, dict) or ("web" not in cfg and "installed" not in cfg):
+            return web.json_response({"ok": False, "error": "Valid Google OAuth client_secret.json chahiye ('installed' ya 'web' key ke saath)"})
+        kind = "web" if "web" in cfg else "installed"
+        os.environ["GOOGLE_CREDENTIALS_JSON"] = json.dumps(cfg, separators=(",", ":"))
+        for p in (os.path.join(DATA_DIR, "client_secret.json"), os.path.join(HERE, "client_secret.json")):
+            try:
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2)
+            except OSError:
+                pass
+        log(f"OAuth client_secret.json upload ho gayi ({kind})", "ok")
+        return web.json_response({"ok": True, "kind": kind})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)[:200]})
+
+
+async def h_drive_auth_token_str(req):
+    if not authed(req):
+        return web.Response(status=401)
+    try:
+        t = load_token_dict()
+        compact = json.dumps(t, separators=(",", ":"))
+        return web.json_response({"ok": True, "token_json": compact})
+    except Exception as e:
+        return web.json_response({"ok": False, "error": str(e)[:200]})
 
 
 async def h_status(req):
@@ -2613,17 +3442,25 @@ def reset_progress():
         FOLDER_CACHE.clear()
     try:
         for fn in os.listdir(DATA_DIR):
-            if fn.endswith(".part"):
-                os.remove(os.path.join(DATA_DIR, fn))
+            full_p = os.path.join(DATA_DIR, fn)
+            if fn.endswith(".part") or fn.endswith(".part.7z"):
+                os.remove(full_p)
+            elif fn.endswith("_enc_tmp") and os.path.isdir(full_p):
+                shutil.rmtree(full_p, ignore_errors=True)
     except OSError:
         pass
 
 
-async def start_job(mode="channel", channel="", folder="", folder_name="", start_id=0, queue=None, csv_opts=None, fresh=False):
+async def start_job(mode="channel", channel="", folder="", folder_name="", start_id=0, queue=None, csv_opts=None, fresh=False, enc_enabled=None, enc_pass=None):
     global JOB
     if JOB and not JOB.done():
         return False, "Pehle se chal raha hai"
     mode = mode if mode in ("channel", "list", "csv") else "channel"
+    if enc_enabled is not None:
+        if enc_enabled and not (enc_pass or "").strip():
+            return False, "7z Encryption ON hai — pehle password daalo"
+        S["enc_enabled"] = bool(enc_enabled)
+        S["enc_pass"] = (enc_pass or "").strip() if enc_enabled else ""
     if mode == "csv":
         opts = csv_opts if isinstance(csv_opts, dict) else S["csv_opts"]
         use_path = bool(opts.get("use_path", True))
@@ -2686,6 +3523,8 @@ async def h_start(req):
         queue=d.get("queue"),
         csv_opts=d.get("csv_opts"),
         fresh=bool(d.get("fresh")),
+        enc_enabled=bool(d.get("enc_enabled", False)),
+        enc_pass=(d.get("enc_pass") or "").strip(),
     )
     return web.json_response({"ok": ok, "error": err})
 
@@ -2714,6 +3553,8 @@ async def startup_checks():
     except Exception as e:
         log(f"disk FAIL: {e}", "err")
     log("cryptg: " + ("OK (fast decrypt)" if HAS_CRYPTG else "nahi hai (optional, speed kam)"), "ok" if HAS_CRYPTG else "warn")
+    _sz = find_7z_bin()
+    log("7z encrypt engine: " + (f"native CLI ({_sz})" if _sz else "py7zr (pure Python fallback)"), "ok")
     for aid, cl in CLIENTS.items():
         a = S["accs"][aid]
         try:
@@ -2726,12 +3567,16 @@ async def startup_checks():
             else:
                 log(f"telegram FAIL: {a['name']}: {e}", "err")
     try:
-        def chk():
-            return drive_service().about().get(fields="user(emailAddress)").execute()["user"]["emailAddress"]
-        em = await asyncio.wait_for(asyncio.to_thread(chk), 30)
-        log(f"drive OK: {em}", "ok")
+        ok, em, err = await asyncio.wait_for(asyncio.to_thread(verify_drive_connection_sync), 30)
+        if ok:
+            log(f"drive OK: {em}", "ok")
+        else:
+            log(f"drive FAIL: {err}  (UI se 'Login Google Drive' karo ya `python tg2gd.py --get-token` chalao)", "err")
     except Exception as e:
-        log(f"drive FAIL: {e}  (token.json check karo)", "err")
+        S["drive_ok"] = False
+        S["drive_expired"] = True
+        S["drive_err"] = str(e)[:200]
+        log(f"drive FAIL: {e}  (UI se 'Login Google Drive' karo)", "err")
     log("------------------------")
 
 
@@ -2766,32 +3611,35 @@ async def on_start(app):
     log(f"UI: http://localhost:{PORT}  (password: {PASSWORD})")
     app["tasks"] = [asyncio.create_task(speed_loop())]
     await startup_checks()
-    log(f"saved state dhoond raha hoon (Drive root: {STATE_FILE_NAME})...")
-    st = None
-    try:
-        fid, st, _ = await asyncio.wait_for(asyncio.to_thread(drive_load_state_sync), 60)
-        if fid:
-            STATE_FILE_ID = fid
-            S["state_file_id"] = fid
-    except Exception as e:
-        log(f"drive state load fail/timeout: {e}", "warn")
+    if S["drive_ok"]:
+        log(f"saved state dhoond raha hoon (Drive root: {STATE_FILE_NAME})...")
         st = None
-    if st:
-        apply_state_dict(st)
-        log(f"Drive state mila ({STATE_FILE_NAME}): mode={S['mode']}, done={S['done_count']}, last_idx={S['last_index_id'] or '-'}", "ok")
-        if st.get("running"):
-            if S["mode"] == "csv" and (S["queue"] or S["csv_staged"].get("items")):
-                log("restart se pehle CSV mode running tha -> auto resume", "warn")
-                await start_job(mode="csv", folder=S["folder"], folder_name=S["folder_name"],
-                                queue=S["queue"] or None, csv_opts=S["csv_opts"])
-            elif S["mode"] == "list" and S["queue"]:
-                log("restart se pehle list mode running tha -> auto resume", "warn")
-                await start_job(mode="list", folder=S["folder"], folder_name=S["folder_name"], queue=S["queue"])
-            elif S["mode"] == "channel" and S["channel"]:
-                log("restart se pehle channel mode running tha -> auto resume", "warn")
-                await start_job(mode="channel", channel=S["channel"], folder=S["folder"], folder_name=S["folder_name"], start_id=S["start_id"])
+        try:
+            fid, st, _ = await asyncio.wait_for(asyncio.to_thread(drive_load_state_sync), 60)
+            if fid:
+                STATE_FILE_ID = fid
+                S["state_file_id"] = fid
+        except Exception as e:
+            log(f"drive state load fail/timeout: {e}", "warn")
+            st = None
+        if st:
+            apply_state_dict(st)
+            log(f"Drive state mila ({STATE_FILE_NAME}): mode={S['mode']}, done={S['done_count']}, last_idx={S['last_index_id'] or '-'}", "ok")
+            if st.get("running"):
+                if S["mode"] == "csv" and (S["queue"] or S["csv_staged"].get("items")):
+                    log("restart se pehle CSV mode running tha -> auto resume", "warn")
+                    await start_job(mode="csv", folder=S["folder"], folder_name=S["folder_name"],
+                                    queue=S["queue"] or None, csv_opts=S["csv_opts"])
+                elif S["mode"] == "list" and S["queue"]:
+                    log("restart se pehle list mode running tha -> auto resume", "warn")
+                    await start_job(mode="list", folder=S["folder"], folder_name=S["folder_name"], queue=S["queue"])
+                elif S["mode"] == "channel" and S["channel"]:
+                    log("restart se pehle channel mode running tha -> auto resume", "warn")
+                    await start_job(mode="channel", channel=S["channel"], folder=S["folder"], folder_name=S["folder_name"], start_id=S["start_id"])
+        else:
+            log(f"Drive root me {STATE_FILE_NAME} nahi mili -> fresh start")
     else:
-        log(f"Drive root me {STATE_FILE_NAME} nahi mili -> fresh start")
+        log("Drive token missing/expired — UI khol kar 'Login Google Drive' karo", "warn")
     app["tasks"].append(asyncio.create_task(state_loop()))
 
 
@@ -2800,6 +3648,14 @@ def main():
     app.add_routes([
         web.get("/", h_index),
         web.route("*", "/login", h_login),
+        web.get("/oauth/start", h_oauth_start),
+        web.get("/oauth/callback", h_oauth_callback),
+        web.get("/api/drive/auth/status", h_drive_auth_status),
+        web.post("/api/drive/auth/url", h_drive_auth_url),
+        web.post("/api/drive/auth/exchange", h_drive_auth_exchange),
+        web.post("/api/drive/auth/paste", h_drive_auth_paste),
+        web.post("/api/drive/auth/credentials", h_drive_auth_credentials),
+        web.get("/api/drive/auth/token_str", h_drive_auth_token_str),
         web.get("/api/status", h_status),
         web.get("/api/state/raw", h_state_raw_get),
         web.post("/api/state/raw", h_state_raw_post),
@@ -2817,4 +3673,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("--get-token", "get-token", "--login", "login"):
+        cli_port = int(sys.argv[2]) if len(sys.argv) > 2 else None
+        run_cli_get_token(cli_port)
+    else:
+        main()
